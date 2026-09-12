@@ -1,4 +1,4 @@
-"""逐叶审计完整训练状态，以少量摘要比较连续运行和恢复后的实际数组。"""
+"""记录各个状态数组的校验值，用于比较连续训练和恢复后的结果。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any, cast
 
 
 def summarize_train_state(state: Any) -> dict[str, Any]:
-    """逐叶读回并释放host视图；不保存另一份大型checkpoint，不更改设备状态。"""
+    """依次读回各个数组，计算校验值后释放主机视图，保持设备状态不变。"""
     import jax
     import numpy as np
 
@@ -30,7 +30,7 @@ def summarize_train_state(state: Any) -> dict[str, Any]:
         del value
     names = [row["name"] for row in records]
     if len(set(names)) != len(names):
-        raise ValueError("训练状态叶路径重复")
+        raise ValueError("训练状态中存在重名数组")
     identity = json.dumps(records, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
     return {
         "complete": True,
@@ -46,19 +46,19 @@ def summarize_train_state(state: Any) -> dict[str, Any]:
 def snapshot_parameter_witness(
     params: Any, trainable: Any, *, max_elements: int = 8192, max_leaves: int = 8
 ) -> dict[str, Any]:
-    """复制少量可训练叶到host，供donation前后证明真实参数变化；不是全树检查。"""
+    """复制少量可训练参数到主机，用于比较更新前后的数值变化。"""
     import jax
     import numpy as np
 
     if max_elements <= 0 or max_leaves <= 0:
-        raise ValueError("更新观察的元素数和叶数上限必须为正")
+        raise ValueError("待检查的元素数和数组数量上限必须为正数")
     paths, structure = jax.tree_util.tree_flatten_with_path(params)
     if trainable is None:
         enabled = [True] * len(paths)
     else:
         enabled, mask_structure = jax.tree.flatten(trainable)
         if cast(Any, mask_structure) != structure or any(not isinstance(flag, bool) for flag in enabled):
-            raise ValueError("trainable必须是与参数同结构的bool叶mask")
+            raise ValueError("trainable 必须与参数结构一致，每个数组对应一个布尔值")
     result = {}
     for (path, leaf), active in zip(paths, enabled, strict=True):
         if not active or not 0 < leaf.size <= max_elements or not np.issubdtype(leaf.dtype, np.floating):
@@ -68,21 +68,21 @@ def snapshot_parameter_witness(
         if len(result) == max_leaves:
             break
     if not result:
-        raise ValueError("没有符合上限的可训练浮点叶，不能伪造参数变化观察")
+        raise ValueError("没有符合大小限制的可训练浮点数组，无法检查参数变化")
     return result
 
 
 def compare_parameter_witness(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
-    """相同实际叶逐元素比较；零变化和非有限值都明确报告。"""
+    """比较对应数组中的各个元素，记录数值变化和非有限值。"""
     import numpy as np
 
     if not before or before.keys() != after.keys():
-        raise ValueError("更新前后观察叶必须非空且路径完全相同")
+        raise ValueError("更新前后的参数记录不能为空，且数组名称必须一致")
     rows = []
     for name, first in before.items():
         second = after[name]
         if first.shape != second.shape or first.dtype != second.dtype:
-            raise ValueError("更新前后观察叶shape/dtype改变")
+            raise ValueError("更新前后数组的形状或类型发生了变化")
         finite = bool(np.isfinite(first).all() and np.isfinite(second).all())
         rows.append(
             {
@@ -102,5 +102,5 @@ def compare_parameter_witness(before: dict[str, Any], after: dict[str, Any]) -> 
         "changed_elements": sum(row["changed_elements"] for row in rows),
         "leaf_count": len(rows),
         "leaves": rows,
-        "scope": "所选小型可训练叶的实际更新见证；全树有限性与恢复用独立最终state审计。",
+        "scope": "此处只检查选中的小型参数数组；全部状态的数值和恢复结果另行检查。",
     }

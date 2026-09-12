@@ -1,4 +1,4 @@
-"""恢复摘要必须覆盖每个参数/Adam叶，且不能漏掉单叶改变和非有限状态。"""
+"""恢复检查必须覆盖全部模型参数和 Adam 状态，能够发现单个数组的变化与非有限值。"""
 
 import numpy as np
 
@@ -44,9 +44,9 @@ def test_update_witness_rejects_incompatible_or_absent_observations():
     params = {"x": np.ones(4, np.float32)}
     with pytest.raises(ValueError, match="没有"):
         snapshot_parameter_witness(params, {"x": False})
-    with pytest.raises(ValueError, match="同结构"):
+    with pytest.raises(ValueError, match="trainable"):
         snapshot_parameter_witness(params, {"y": True})
     with pytest.raises(ValueError, match="没有"):
         snapshot_parameter_witness(params, None, max_elements=2)
-    with pytest.raises(ValueError, match="shape/dtype"):
+    with pytest.raises(ValueError, match="形状|类型"):
         compare_parameter_witness({"x": np.ones(2, np.float32)}, {"x": np.ones(2, np.float64)})

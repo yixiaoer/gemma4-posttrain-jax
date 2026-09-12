@@ -67,7 +67,7 @@ def main() -> None:
     parser.add_argument("--dev-seed", type=int, default=0)
     parser.add_argument("--reward-workers", type=int, default=4)
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--wandb-project", default="gemma4-posttrain-jax")
+    parser.add_argument("--wandb-project", default="gemma4_posttrain_jax")
     parser.add_argument("--wandb-run-name")
     parser.add_argument("--wandb-tags", nargs="*", default=())
     args = parser.parse_args()
@@ -231,6 +231,8 @@ def main() -> None:
             "data_provenance": provenance,
             "indices_sha256": indices_sha256(indices),
             "sampler": sampler_config._asdict(),
+            "sampling_math_protocol": "fp32-exp-log-highest-v1",
+            "prediction_record_schema": "raw-token-ids-v1",
             "jax_default_matmul_precision": jax.config.jax_default_matmul_precision or "default",
             "jax": jax.__version__,
             "libtpu": optional_package_version("libtpu"),

@@ -1,4 +1,4 @@
-"""固定MATH来源的语义审计修正；答案由原train题意决定，哈希失配立即拒绝。"""
+"""MATH 训练数据的答案修正。修正依据原题，使用前核对题目和解答的校验值。"""
 
 from typing import NamedTuple
 

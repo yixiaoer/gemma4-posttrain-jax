@@ -128,7 +128,7 @@ def compare_with_hf(
         )[:, ids.shape[1] :].tolist()
     print(f"Transformers CPU FP32生成耗时（含模型加载）：{time.perf_counter() - start:.3f}秒")
     if args.temperature > 0:
-        print("随机采样：两个框架的随机数实现不同，相同seed不保证相同回答；此处并列显示输出。")
+        print("两个框架使用不同的随机数实现，相同的随机种子也不保证相同的回答。下面分别显示生成结果。")
     for index, (jax_tokens, hf_tokens) in enumerate(zip(generated, output, strict=True), start=1):
         eos_index = next((i for i, token in enumerate(hf_tokens) if token in eos_ids), None)
         if eos_index is not None:

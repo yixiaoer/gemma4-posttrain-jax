@@ -73,7 +73,7 @@ def prepare_math_training_rows(
     for row in training:
         question = str(row["problem"]).strip()
         if not question:
-            raise ValueError("MATH存在空问题，固定来源需要重新审计")
+            raise ValueError("MATH 数据中存在空题目，需要重新检查数据来源")
         key = question_key(question)
         reasons = []
         if counts[key] > 1:
@@ -89,7 +89,7 @@ def prepare_math_training_rows(
         if correction is not None:
             solution_sha = hashlib.sha256(str(row["solution"]).encode()).hexdigest()
             if key != correction.question_sha256 or solution_sha != correction.solution_sha256:
-                raise ValueError(f"MATH审计修正来源哈希失配: {row['source_id']}")
+                raise ValueError(f"MATH 答案修正对应的原题或解答已改变: {row['source_id']}")
             if not correction.answers:
                 reasons.append(correction.reason)
         if reasons:

@@ -1,81 +1,55 @@
 # Gemma4 Posttrain JAX
 
-在单机TPU v4上进行Gemma 4后训练，包含纯JAX的函数式模型实现、SFT、GRPO家族、原生rollout，以及可选的vLLM tpu 版本的tpu-inference适配。
+在 TPU 上实现和研究 Gemma 4 后训练的 JAX 项目，包含文本模型、监督微调（SFT）、GRPO 等强化学习算法、文本生成，以及训练状态的保存和恢复。
 
-进行实验开发和逆向的主要模型使用Gemma 4 E2B-it；E4B和LoRA保留已有实现，但还没有对Gemma 4所有模型、算法、后端的不同组合进行完整测试。
+主要使用 Gemma 4 E2B 和单机 TPU v4。代码将模型参数显式传给 JAX 函数，便于阅读模型前向、概率计算和梯度更新的实现；文档记录实际实验结果，解释数值误差、内存占用和运行速度的原因。
 
-## 目录
+## 安装和运行
 
-```text
-gemma4_posttrain_jax/   模型、算法、采样、分片与状态管理
-scripts/               生成、训练、评估、检查和吞吐测量
-tests/                 核心功能及运行接口的回归测试
-docs/                  设计说明与实验结果
-pyproject.toml         依赖和打包配置
-```
-
-package直接位于仓库根目录，导入名为`gemma4_posttrain_jax`。
-
-## 安装
-
-在已配置的TPU v4环境中使用Python 3.12：
+使用 Python 3.12，在仓库根目录安装：
 
 ```bash
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -e ".[tpu,hf,dev]"
-.venv/bin/python scripts/check_env.py
+.venv/bin/python scripts/check_env.py --backend tpu
 ```
 
-CPU开发环境安装`.[hf,dev]`。详细依赖见[pyproject.toml](pyproject.toml)；模型权重和数据集需要另行下载，TPU运行库通过`.[tpu]`安装。模型路径指向已下载的HF snapshot，其中应包含config、tokenizer和safetensors。
+CPU 开发环境安装 `.[hf,dev]`，检查环境时使用 `JAX_PLATFORMS=cpu` 和 `--backend cpu`。发行包名是 `gemma4-posttrain-jax`，Python 导入名是 `gemma4_posttrain_jax`。
 
-## 运行入口
-
-| 脚本 | 用途 |
-|---|---|
-| [generate.py](scripts/generate.py) | 单设备batch生成，支持greedy、temperature、TopK、Top-p及组合采样；可选与Hugging Face Transformers的生成结果比较 |
-| [train_sft.py](scripts/train_sft.py) | FSDP SFT、梯度累积、保存与恢复 |
-| [train_grpo.py](scripts/train_grpo.py) | GRPO、Dr.GRPO、DAPO、GSPO-token、RLOO及LoRA训练入口 |
-| [evaluate_gsm8k.py](scripts/evaluate_gsm8k.py) | GSM8K或MATH评估，支持初始模型与训练checkpoint |
-| [check_checkpoint.py](scripts/check_checkpoint.py) | 检查完整状态、步数、有限性和Adam状态 |
-| [check_env.py](scripts/check_env.py) | 检查JAX、TPU设备及基础Pallas环境 |
-| [benchmark_rollout.py](scripts/benchmark_rollout.py) | 原生batch rollout的独立进程吞吐测量 |
-
-例如，已有E2B模型可以这样生成：
+准备好 E2B 的 Hugging Face 模型目录后，可以生成回答或运行训练示例：
 
 ```bash
 .venv/bin/python scripts/generate.py \
-  --model /path/to/gemma4-snapshot \
-  --chat --prompt "计算3乘4再加2。" --max-new-tokens 64
+  --model /path/to/e2b-snapshot --chat \
+  --prompt "计算3乘4再加2。" --max-new-tokens 64
+
+bash examples/e2b_sft_smoke.sh /path/to/e2b-snapshot /path/to/new-sft
+bash examples/e2b_grpo_recovery.sh /path/to/e2b-snapshot /path/to/new-grpo
 ```
 
-SFT和RL入口均可用`--help`查看配置，训练时显式提供模型路径、数据/形状与新的输出目录：
+SFT 示例用一道内置问答检查训练流程：每一步根据 loss 计算梯度，再由 Adam 修改模型参数，连续运行 4 步。GRPO 示例会保存训练状态，再启动新进程继续训练，检查结果是否与连续训练一致；它会生成三个完整状态文件，合计约 **94 GiB**。示例的目的、具体步骤和输出说明见[安装与使用](docs/quickstart.md)。
 
-```bash
-.venv/bin/python scripts/train_sft.py --help
-.venv/bin/python scripts/train_grpo.py --help
-.venv/bin/python scripts/evaluate_gsm8k.py --help
-```
+## 目前能做什么
 
-`train_grpo.py --algorithm dapo`包含动态补采等行为，`dapo-loss`只选择目标函数。`--updates-per-rollout`表示同一生成batch执行几次Adam更新；prompt题数乘`--group-size`才是展开采样行数，`--microbatch-size`是训练microbatch。
+| 功能 | 已完成的范围 |
+|---|---|
+| E2B 文本模型、SFT、原生 GRPO | 已在 TPU v4 上运行，包含生成、训练、保存、恢复和独立评估 |
+| Dr. GRPO、DAPO、GSPO-token、RLOO 等 | 已有实现和限定配置下的实验，尚未覆盖所有模型与参数组合 |
+| TopK、Top-p 生成 | 已有 CPU/TPU 测试；RL 入口目前使用温度 1 的完整词表采样 |
+| tpu-inference | 实验性接入；完整的跨后端质量、成本和故障处理比较仍在进行 |
+| E4B、12B LoRA | E4B 有独立实验；12B 仍需完成真实 TPU 训练和恢复验证 |
 
-使用`--save-every`启用保存，`--resume`指定完整step目录继续训练。恢复检查包括训练配置、优化器与随机/数据状态；旧checkpoint的格式标识保留，以免仅因项目改名破坏读取。历史引擎checkpoint还包含源码SHA，更名后的跨版本续训兼容性需要单独验证。RL与评估脚本会记录Git版本和实际源码SHA；没有Git HEAD时版本记录为`null`，仍可运行。
+## 文档
 
-## 实现范围
+文档集中在四个文件中，每篇都包含对应主题的完整说明：
 
-模型和训练使用显式参数树、JAX函数与Optax。默认训练保留FP32 master/Adam，计算通常使用BF16；精度、remat、冻结embedding和分片配置会影响容量与数值行为，具体以运行参数为准。
+| 文档 | 内容 |
+|---|---|
+| [安装与使用](docs/quickstart.md) | 环境准备、生成、SFT、GRPO、保存和继续训练、评估、数值与性能实验 |
+| [实现说明](docs/architecture.md) | 模型结构、训练目标、采样概率、设备分片和状态恢复 |
+| [实验结果与分析](docs/development-results.md) | 模型精度、训练效果、词表并行、采样精度与权重同步的定位过程、可运行小实验及其他研究结果 |
+| [测试方法与运行记录](docs/validation.md) | 测试命令、实际运行环境、通过的检查和尚未覆盖的范围 |
 
-原生rollout在设备循环中执行batch decode。tpu-inference同进程／独立进程适配仍是实验入口，要求匹配源码中锁定的独立环境与运行库身份，普通安装不能替代该环境。两进程不表示训练与生成已异步重叠；引擎共同配置下的恢复、故障退出、跨后端对齐和正式多seed质量仍有待办。
-
-## 测试
-
-CPU测试需要`hf`与`dev`依赖；tiny模型直接构造，无需下载真实权重。
-
-```bash
-JAX_PLATFORMS=cpu .venv/bin/python -m pytest -q -m 'not tpu and not full_model'
-.venv/bin/ruff check gemma4_posttrain_jax scripts tests
-.venv/bin/ruff format --check gemma4_posttrain_jax scripts tests
-```
-
-TPU sharding测试使用`tpu`标记，真实模型测试使用`full_model`标记，须在相应设备和模型条件下单独运行。当前版本的验证范围与实验结论见[设计与实验结果](docs/development-results.md)。
+`gemma4_posttrain_jax/` 是 Python 包，`scripts/` 提供运行命令，`examples/` 组合训练步骤，`tests/` 保存测试。实验结果和分析写在文档中；运行脚本生成的数据、日志和编译图保存在本地 `outputs/`。
 
 源码采用[MIT](LICENSE)。模型、tokenizer、数据集和外部依赖的许可分别适用。

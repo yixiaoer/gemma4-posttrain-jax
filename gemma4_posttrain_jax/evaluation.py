@@ -233,6 +233,9 @@ def evaluate_batches(
                     "dataset_index": batch.indices[row],
                     "gold": batch.golds[row],
                     "completion": text,
+                    # 从实际输入/输出取ID；保留有效EOS及pad值，不能由解码文本重新分词补造。
+                    "prompt_token_ids": batch.prompt_ids[row, batch.prompt_mask[row]].tolist(),
+                    "completion_token_ids": ids[row, : int(lengths[row])].tolist(),
                     "length": int(lengths[row]),
                     "task_success": float(rewards.task_success[row]),
                     "format_reward": float(rewards.format_reward[row]),

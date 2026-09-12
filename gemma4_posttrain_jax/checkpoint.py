@@ -15,9 +15,13 @@ from typing import Any, BinaryIO, cast
 import jax
 import jax.numpy as jnp
 import numpy as np
-from safetensors.numpy import load_file, save
+from safetensors import safe_open
+from safetensors.numpy import save
 
-FORMAT_NAME = "gemma4-rl-jax-train-state"
+# gemma4_posttrain_jax 的完整训练状态格式。
+FORMAT_NAME = "gemma4_posttrain_jax-train-state"
+# 兼容读取初版文件；保存新文件时使用 FORMAT_NAME。
+LEGACY_FORMAT_NAMES = frozenset({"gemma4-rl-jax-train-state"})
 FORMAT_VERSION = 1
 
 
@@ -150,7 +154,7 @@ def read_checkpoint_metadata(path: str | os.PathLike[str]) -> dict[str, Any]:
     checkpoint = Path(path)
     with open(checkpoint / "meta.json", encoding="utf-8") as file:
         document = json.load(file)
-    if document.get("format") != FORMAT_NAME or document.get("version") != FORMAT_VERSION:
+    if document.get("format") not in {FORMAT_NAME, *LEGACY_FORMAT_NAMES} or document.get("version") != FORMAT_VERSION:
         raise ValueError(
             f"unsupported checkpoint format/version: {document.get('format')!r}/{document.get('version')!r}"
         )
@@ -175,34 +179,48 @@ def load_train_state[T](
     checkpoint = Path(path)
     document = read_checkpoint_metadata(checkpoint)
     names, template_leaves, treedef = _flatten_named(template)
-    stored = load_file(checkpoint / "state.safetensors")
-    if set(stored) != set(names):
-        missing = sorted(set(names) - set(stored))
-        extra = sorted(set(stored) - set(names))
-        raise ValueError(f"checkpoint pytree keys differ: missing={missing} extra={extra}")
-
     manifest = {entry["name"]: entry for entry in document["leaves"]}
-    if set(manifest) != set(names):
+    if len(manifest) != len(document["leaves"]) or set(manifest) != set(names):
         raise ValueError("checkpoint manifest leaf keys differ from the template")
-    for name, template_leaf in zip(names, template_leaves, strict=True):
-        array = stored[name]
-        expected_shape = tuple(template_leaf.shape)
-        expected_dtype = np.dtype(template_leaf.dtype)
-        if array.shape != expected_shape or np.dtype(array.dtype) != expected_dtype:
-            raise ValueError(
-                f"checkpoint leaf {name} has {array.shape}/{array.dtype}, expected {expected_shape}/{expected_dtype}"
-            )
-        entry = manifest[name]
-        if tuple(entry["shape"]) != array.shape or np.dtype(entry["dtype"]) != np.dtype(array.dtype):
-            raise ValueError(f"checkpoint manifest disagrees with state.safetensors for {name}")
-
     if shardings is None:
-        restored_leaves = [jnp.asarray(stored[name]) for name in names]
+        sharding_leaves = [None] * len(names)
     else:
         sharding_leaves, sharding_treedef = jax.tree.flatten(shardings)
         if sharding_treedef != treedef:
             raise ValueError("checkpoint sharding tree does not match the train-state template")
-        restored_leaves = [
-            jax.device_put(stored[name], sharding) for name, sharding in zip(names, sharding_leaves, strict=True)
-        ]
+
+    restored_leaves = []
+    with safe_open(checkpoint / "state.safetensors", framework="np") as stored:
+        if set(stored.keys()) != set(names):
+            missing = sorted(set(names) - set(stored.keys()))
+            extra = sorted(set(stored.keys()) - set(names))
+            raise ValueError(f"checkpoint pytree keys differ: missing={missing} extra={extra}")
+        # 先检查全部数组的形状和类型，再分配设备内存。
+        for name, template_leaf in zip(names, template_leaves, strict=True):
+            signature = stored.get_slice(name)
+            shape, dtype = tuple(signature.get_shape()), signature.get_dtype()
+            expected_shape, expected_dtype = tuple(template_leaf.shape), np.dtype(template_leaf.dtype)
+            if np.dtype(jax.dtypes.canonicalize_dtype(expected_dtype)) != expected_dtype:
+                raise ValueError(
+                    f"checkpoint leaf {name} requires {expected_dtype}; enable JAX_ENABLE_X64=1 before restoring"
+                )
+            if shape != expected_shape or dtype != _safetensors_dtype(expected_dtype):
+                raise ValueError(
+                    f"checkpoint leaf {name} has {shape}/{dtype}, expected {expected_shape}/{expected_dtype}"
+                )
+            entry = manifest[name]
+            if tuple(entry["shape"]) != shape or np.dtype(entry["dtype"]) != expected_dtype:
+                raise ValueError(f"checkpoint manifest disagrees with state.safetensors for {name}")
+        try:
+            for name, sharding in zip(names, sharding_leaves, strict=True):
+                array = stored.get_tensor(name)
+                restored = jnp.asarray(array) if sharding is None else jax.device_put(array, sharding)
+                restored_leaves.append(restored)
+                # 等待当前传输结束，避免异步队列同时保留所有主机数组。
+                restored.block_until_ready()
+                del array
+        except BaseException:
+            for restored in restored_leaves:
+                restored.delete()
+            raise
     return cast(T, jax.tree.unflatten(treedef, restored_leaves))

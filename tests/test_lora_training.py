@@ -93,7 +93,7 @@ def test_four_cpu_microbatch_joint_old_and_full_state_restore(training_fixture, 
     assert read_checkpoint_metadata(checkpoint)["metadata"] == metadata
     template = jax.eval_shape(lambda: state)
     restored = load_train_state(checkpoint, template, shardings=tree_shardings(state))
-    # 完整轮边界后重新捕获old；恢复后的下两个Adam与连续运行逐叶完全一致。
+    # 在完整一轮结束后重新计算 old；恢复后的两次更新与连续训练的所有数组一致。
     for branch in range(2):
         target = state if branch == 0 else restored
         target, next_metrics = micro(target, base, old, jnp.asarray(True))

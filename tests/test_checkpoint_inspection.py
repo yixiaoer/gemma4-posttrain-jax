@@ -30,7 +30,7 @@ def test_checkpoint_inspection_checks_serialized_state(tmp_path: Path, corruptio
     if corruption == "shape":
         leaves[-1]["shape"] = [3, 5]
     (tmp_path / "meta.json").write_text(
-        json.dumps({"format": "gemma4-rl-jax-train-state", "version": 1, "leaves": leaves, "metadata": {}})
+        json.dumps({"format": "gemma4_posttrain_jax-train-state", "version": 1, "leaves": leaves, "metadata": {}})
     )
     save_file(arrays, tmp_path / "state.safetensors")
     if corruption:
@@ -60,7 +60,7 @@ def test_inspection_validates_lagged_behavior_snapshot(tmp_path: Path, corruptio
     if corruption == "missing":
         del arrays[".behavior.params_bf16.weight"]
     document = {
-        "format": "gemma4-rl-jax-train-state",
+        "format": "gemma4_posttrain_jax-train-state",
         "version": 1,
         "metadata": {"run_config": {"rollout_lag_updates": 1}},
         "leaves": [
@@ -89,7 +89,7 @@ def test_inspection_requires_both_actual_nonzero_adam_moments(tmp_path: Path, ze
         if zero_moment in (key, "both"):
             arrays[f".opt_state.inner.adam.{key}.weight"][:] = 0
     document = {
-        "format": "gemma4-rl-jax-train-state",
+        "format": "gemma4_posttrain_jax-train-state",
         "version": 1,
         "metadata": {},
         "leaves": [
@@ -105,3 +105,32 @@ def test_inspection_requires_both_actual_nonzero_adam_moments(tmp_path: Path, ze
         with pytest.raises(ValueError, match="非零Adam"):
             check_checkpoint(tmp_path, 4, require_nonzero_adam=True)
         assert check_checkpoint(tmp_path, 4)["all_finite"]
+
+
+@pytest.mark.parametrize("shape", [(0, 3), (3, 0, 7)])
+@pytest.mark.parametrize("wrong_dtype", [False, True])
+def test_inspection_checks_header_dtype_even_for_empty_arrays(tmp_path, shape, wrong_dtype):
+    arrays = {
+        ".step": np.asarray(1, np.int32),
+        ".opt_state.adam.count": np.asarray(1, np.int32),
+        ".params.empty": np.empty(shape, np.float32),
+    }
+    leaves = [{"name": k, "shape": list(v.shape), "dtype": str(v.dtype)} for k, v in arrays.items()]
+    if wrong_dtype:
+        leaves[-1]["dtype"] = "int32"
+    (tmp_path / "meta.json").write_text(
+        json.dumps(
+            {
+                "format": "gemma4_posttrain_jax-train-state",
+                "version": 1,
+                "metadata": {},
+                "leaves": leaves,
+            }
+        )
+    )
+    save_file(arrays, tmp_path / "state.safetensors")
+    if wrong_dtype:
+        with pytest.raises(ValueError, match="dtype"):
+            check_checkpoint(tmp_path, 1)
+    else:
+        assert check_checkpoint(tmp_path, 1)["array_bytes"] == 8

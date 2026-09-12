@@ -10,7 +10,6 @@ import itertools
 import json
 import math
 import os
-import subprocess
 import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -23,7 +22,7 @@ from jax.sharding import NamedSharding
 from gemma4_posttrain_jax.bench import device_peak_bytes
 from gemma4_posttrain_jax.checkpoint import load_train_state, read_checkpoint_metadata, save_train_state
 from gemma4_posttrain_jax.data import GSM8KBatchStream, collate_sft, encode_sft_example, load_gsm8k
-from gemma4_posttrain_jax.diagnostics import optional_package_version
+from gemma4_posttrain_jax.diagnostics import optional_package_version, source_git_state
 from gemma4_posttrain_jax.losses import init_train_state, make_optimizer, train_step
 from gemma4_posttrain_jax.sharding import (
     batch_spec,
@@ -94,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--log-csv", default="outputs/logs/sft.csv")
     parser.add_argument("--wandb", action="store_true", help="enable optional host-side Weights & Biases logging")
-    parser.add_argument("--wandb-project", default="gemma4-posttrain-jax")
+    parser.add_argument("--wandb-project", default="gemma4_posttrain_jax")
     parser.add_argument("--wandb-run-name")
     parser.add_argument("--wandb-tags", nargs="*", default=())
     parser.add_argument("--save-every", type=int, default=0, help="save the full train state every N steps; 0 disables")
@@ -128,19 +127,9 @@ def jit_cache_size(jitted: Any) -> int | None:
 
 
 def git_commit() -> str | None:
-    """Return the source revision without making the training path depend on Git."""
+    """按脚本源码目录记录提交；独立快照不继承运行目录或父仓库身份。"""
 
-    try:
-        result = subprocess.run(
-            ("git", "rev-parse", "HEAD"),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return None
-    return result.stdout.strip() or None
+    return source_git_state(Path(__file__).resolve().parents[1])[0]
 
 
 def estimated_mfu(*, tokens: int, elapsed_s: float) -> float:

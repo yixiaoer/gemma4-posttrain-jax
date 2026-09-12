@@ -2,10 +2,60 @@
 
 from __future__ import annotations
 
+import importlib.metadata
+import subprocess
+
 import numpy as np
 import pytest
 
-from gemma4_posttrain_jax.diagnostics import array_drift_metrics, logprob_drift_metrics
+from gemma4_posttrain_jax.diagnostics import (
+    array_drift_metrics,
+    logprob_drift_metrics,
+    optional_package_version,
+    source_git_state,
+)
+
+
+def test_source_identity_uses_source_root_and_rejects_unrelated_parent_repo(tmp_path, monkeypatch):
+    repo = tmp_path / "source"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    source = repo / "model.py"
+    source.write_text("value = 1\n")
+    subprocess.run(["git", "-C", str(repo), "add", "model.py"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ],
+        check=True,
+    )
+    monkeypatch.chdir(tmp_path)
+    revision, diff = source_git_state(repo)
+    assert revision == subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    assert diff == ""
+    source.write_text("value = 2\n")
+    assert "+value = 2" in source_git_state(repo)[1]
+    nested = repo / "independent-snapshot"
+    nested.mkdir()
+    assert source_git_state(nested) == (None, None)
+    assert source_git_state(tmp_path) == (None, None)
+
+
+def test_missing_optional_runtime_is_recorded_as_null(monkeypatch):
+    def missing(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", missing)
+    assert optional_package_version("libtpu") is None
 
 
 def test_array_and_logprob_drift_only_use_selected_rows() -> None:

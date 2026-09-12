@@ -277,6 +277,23 @@ def test_mu_two_host_loop_resume_preserves_old_batch_and_full_state(
 
     original_metadata_reader = trainer.read_checkpoint_metadata
 
+    assert saved_config["top_p"] == 1.0
+    assert saved_config["sampling_math_protocol"] == "fp32-exp-log-highest-v1"
+    for field, value in (("sampling_math_protocol", None), ("sampling_math_protocol", "legacy"), ("top_p", 0.9)):
+
+        def changed_sampling(path, field=field, value=value):
+            record = original_metadata_reader(path)
+            config = record["metadata"]["run_config"]
+            if value is None:
+                del config[field]
+            else:
+                config[field] = value
+            return record
+
+        monkeypatch.setattr(trainer, "read_checkpoint_metadata", changed_sampling)
+        with pytest.raises(ValueError, match="恢复配置"):
+            run(f"changed_{field}_{value}", continuous_checkpoints / "step_00000002")
+
     def read_legacy_checkpoint(path):
         record = original_metadata_reader(path)
         del record["metadata"]["run_config"]["jax_default_matmul_precision"]

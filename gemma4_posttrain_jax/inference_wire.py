@@ -1,4 +1,4 @@
-"""本机独立进程的有限JSON控制帧、完整FP32参数树描述与原始字节运输。
+"""本机独立进程的有限JSON控制帧、完整 FP32 参数结构描述与原始字节运输。
 
 协议不反序列化pickle；只接收白名单参数结构，缓冲寿命以接收/提交ACK区分。
 """
@@ -110,7 +110,7 @@ def describe_tree(params: Any) -> tuple[dict[str, Any], list[Any]]:
 
     def visit(value: Any, path: str, depth: int) -> dict[str, Any]:
         if depth > 64:
-            raise WireError("参数树层级超界")
+            raise WireError("参数结构的嵌套层数超出限制")
         if value is None:
             return {"kind": "none"}
         if isinstance(value, tuple):
@@ -122,7 +122,7 @@ def describe_tree(params: Any) -> tuple[dict[str, Any], list[Any]]:
                 names = list(types[name]._fields)
                 kind = name
             else:
-                raise WireError("参数树类型不在固定白名单")
+                raise WireError("参数容器的类型不受支持")
             return {
                 "kind": kind,
                 "children": [
@@ -150,12 +150,12 @@ def validate_descriptor(descriptor: dict[str, Any], config: Any = None) -> tuple
     records: list[dict[str, Any]] = []
     total = 0
     if set(descriptor) != {"protocol", "tree"} or descriptor["protocol"] != PROTOCOL:
-        raise WireError("参数树协议版本不符")
+        raise WireError("参数传输协议版本不符")
 
     def visit(node: Any, path: str, depth: int) -> Any:
         nonlocal total
         if not isinstance(node, dict) or depth > 64:
-            raise WireError("参数树结构非法")
+            raise WireError("参数结构不符合要求")
         kind = node.get("kind")
         if not isinstance(kind, str):
             raise WireError("参数类型名必须为字符串")
@@ -163,22 +163,22 @@ def validate_descriptor(descriptor: dict[str, Any], config: Any = None) -> tuple
             return None
         if kind == "leaf":
             if set(node) != {"kind", "index", "path", "shape", "dtype"}:
-                raise WireError("叶元数据字段不符")
+                raise WireError("数组元数据的字段不符")
             shape = node["shape"]
             if not isinstance(shape, list) or len(shape) > 4 or any(type(x) is not int or x <= 0 for x in shape):
-                raise WireError("参数叶形状非法")
+                raise WireError("参数数组的形状不符合要求")
             if (
                 type(node["index"]) is not int
                 or node["index"] != len(records)
                 or node["path"] != path
                 or node["dtype"] != "<f4"
             ):
-                raise WireError("叶顺序/路径/dtype不符")
+                raise WireError("数组的顺序、名称或类型不符")
             size = math.prod(shape) * 4
             # 不从发送端的任意nbytes决定分配，按已经校验的shape计算。
             total += size
             if size > MAX_LEAF_BYTES or total > MAX_TREE_BYTES or len(records) >= MAX_LEAVES:
-                raise WireError("参数字节数或叶数超界")
+                raise WireError("参数总字节数或数组数量超出限制")
             records.append({**node, "bytes": size})
             return ShapeOnly(tuple(shape))
         if set(node) != {"kind", "children"} or not isinstance(node["children"], list):
@@ -205,7 +205,7 @@ def validate_descriptor(descriptor: dict[str, Any], config: Any = None) -> tuple
         from .weights import check_gemma4_text_params
 
         if type(tree) is not Gemma4TextParams or not __debug__:
-            raise WireError("需要完整Gemma4树及启用shape断言的解释器")
+            raise WireError("需要完整的 Gemma4 模型参数，且不能关闭形状断言")
         try:
             check_gemma4_text_params(tree, config)
         except (AssertionError, AttributeError) as error:
@@ -217,7 +217,7 @@ def rebuild_tree(descriptor: dict[str, Any], leaves: list[Any]) -> Any:
     types = parameter_types()
     _, records = validate_descriptor(descriptor)
     if len(records) != len(leaves):
-        raise WireError("接收叶数量不同")
+        raise WireError("接收的参数数组数量不同")
 
     def visit(node: dict[str, Any]) -> Any:
         kind = node["kind"]

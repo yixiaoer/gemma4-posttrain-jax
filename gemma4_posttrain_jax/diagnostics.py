@@ -24,6 +24,17 @@ def source_git_state(source_root: Path) -> tuple[str | None, str | None]:
     """Git元数据可缺省；未提交目录或源码包仍由调用方记录实际源码SHA。"""
 
     try:
+        root = subprocess.run(
+            ("git", "rev-parse", "--show-toplevel"),
+            cwd=source_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout.strip()
+        # 独立源码快照可能放在另一个仓库内，不能继承那个仓库的提交身份。
+        if Path(root).resolve() != source_root.resolve():
+            return None, None
         revision = subprocess.run(
             ("git", "rev-parse", "HEAD"), cwd=source_root, check=True, capture_output=True, text=True, timeout=5
         ).stdout.strip()

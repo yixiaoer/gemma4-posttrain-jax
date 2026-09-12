@@ -1,4 +1,4 @@
-"""独立的attention低秩参数树；冻结HF基础权重，缩放与合并均为纯函数。"""
+"""独立保存 attention 的 LoRA 参数；基础权重保持冻结，缩放和合并使用纯函数。"""
 
 from __future__ import annotations
 
@@ -116,7 +116,7 @@ def forward_lora_projection(params: LowRankParams | None, x: Array, base_output:
 def merge_lora_params(
     base: Gemma4TextParams, params: Gemma4LoRAParams, config: LoRAConfig, *, dtype: Any = jnp.float32
 ) -> Gemma4TextParams:
-    """导出时合并(alpha/r)AB，返回普通Gemma4参数树；BF16导出舍入需单独报告。"""
+    """导出时合并(alpha/r)AB，返回合并后的 Gemma4 模型参数；BF16导出舍入需单独报告。"""
     check_lora_params(base, params, config)
     prepared = prepare_lora_params(params, config)
     layers = []

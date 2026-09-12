@@ -101,4 +101,4 @@ def test_cli_batch_generation_matches_transformers_with_one_candidate(tiny_a, mo
     if temperature == 0:
         assert output.count("greedy token完全一致：True") == 2
     else:
-        assert "相同seed不保证相同回答" in output
+        assert "相同的随机种子也不保证相同的回答" in output

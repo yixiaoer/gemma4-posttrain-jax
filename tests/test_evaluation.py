@@ -46,6 +46,11 @@ def test_eval_padding_is_excluded_and_eos_at_limit_is_not_truncated(tmp_path) ->
     assert len(records) == len(set(summary["dataset_indices"])) == 5
     assert records[1]["truncated"] is False
     assert records[2]["truncated"] is True
+    assert [record["completion_token_ids"] for record in records] == [[7, 1], [8, 0, 1], [7, 7, 7], [7, 1], [7, 1]]
+    assert [record["prompt_token_ids"] for record in records] == [
+        batch.prompt_ids[row, batch.prompt_mask[row]].tolist() for batch in batches for row in range(len(batch.indices))
+    ]
+    assert all(len(record["completion_token_ids"]) == record["length"] for record in records)
     np.testing.assert_array_equal(keys[1], jax.random.fold_in(jax.random.PRNGKey(9), 1))
     np.testing.assert_array_equal(params, [1.25, 2.5])
     with pytest.raises(FileExistsError):

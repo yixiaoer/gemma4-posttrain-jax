@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""在CPU上逐块检查完整训练状态的manifest、shape/dtype、有限值和步数。"""
+"""在 CPU 上分块检查训练状态的数组、数值和步数。"""
 
 from __future__ import annotations
 
@@ -13,14 +13,14 @@ import ml_dtypes
 import numpy as np
 from safetensors import safe_open
 
+from gemma4_posttrain_jax.checkpoint import _safetensors_dtype, read_checkpoint_metadata
+
 
 def check_checkpoint(path: Path, expected_step: int, *, require_nonzero_adam: bool = False) -> dict[str, Any]:
-    document = json.loads((path / "meta.json").read_text())
-    if document["format"] != "gemma4-rl-jax-train-state" or document["version"] != 1:
-        raise ValueError("不支持的checkpoint格式")
+    document = read_checkpoint_metadata(path)
     entries = {entry["name"]: entry for entry in document["leaves"]}
     if len(entries) != len(document["leaves"]):
-        raise ValueError("manifest包含重复叶子")
+        raise ValueError("状态文件目录中存在重名数组")
     lag = document["metadata"].get("run_config", {}).get("rollout_lag_updates", 0)
     if lag not in (0, 1):
         raise ValueError("只支持同步或一次Adam滞后checkpoint")
@@ -30,20 +30,23 @@ def check_checkpoint(path: Path, expected_step: int, *, require_nonzero_adam: bo
     array_bytes = 0
     with safe_open(path / "state.safetensors", framework="numpy") as stored:
         if set(stored.keys()) != entries.keys():
-            raise ValueError("manifest与safetensors的叶子集合不一致")
+            raise ValueError("状态文件目录与 safetensors 中的数组名称不一致")
         for name, entry in entries.items():
             view = stored.get_slice(name)
             shape = tuple(view.get_shape())
             if shape != tuple(entry["shape"]):
                 raise ValueError(f"shape不一致：{name}")
             dtype = np.dtype(ml_dtypes.bfloat16 if entry["dtype"] == "bfloat16" else entry["dtype"])
+            if view.get_dtype() != _safetensors_dtype(dtype):
+                raise ValueError(f"dtype不一致：{name}")
             elements += math.prod(shape)
             array_bytes += math.prod(shape) * dtype.itemsize
             moment = next(
                 (key for key in moment_nonzero if name.startswith(f"{prefix}.opt_state") and f".{key}." in name), None
             )
             # 按首轴切片，避免一次加载最大的PLE表或整份Adam状态。
-            rows = max(1, 8 * 2**20 // (math.prod(shape[1:]) * dtype.itemsize)) if shape else 1
+            row_bytes = math.prod(shape[1:]) * dtype.itemsize
+            rows = max(1, 8 * 2**20 // max(1, row_bytes)) if shape else 1
             for start in range(0, shape[0] if shape else 1, rows):
                 value = view[start : min(start + rows, shape[0])] if shape else stored.get_tensor(name)
                 if value.dtype != dtype or not np.isfinite(value).all():
@@ -82,7 +85,7 @@ def check_checkpoint(path: Path, expected_step: int, *, require_nonzero_adam: bo
                     if name.startswith(".behavior.params_bf16")
                 )
             ):
-                raise ValueError("行为快照必须是完整同shape的BF16参数树")
+                raise ValueError("行为策略快照必须包含全部 BF16 参数，且形状与训练参数一致")
         if not optimizer_counts or any(count != step for count in optimizer_counts.values()):
             raise ValueError(f"Adam count与全局step不一致：{optimizer_counts} / {step}")
     if require_nonzero_adam and not all(moment_nonzero.values()):

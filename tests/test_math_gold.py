@@ -54,7 +54,7 @@ def test_invalid_alternatives_are_not_silently_ignored(alternatives) -> None:
 
 
 def test_pinned_correction_rejects_changed_source() -> None:
-    with pytest.raises(ValueError, match="哈希失配"):
+    with pytest.raises(ValueError, match="train/algebra/row_334"):
         prepare_math_training_rows(
             [{"source_id": "train/algebra/row_334", "problem": "changed", "solution": r"\boxed{1}"}], []
         )

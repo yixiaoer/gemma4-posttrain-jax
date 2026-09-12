@@ -1,4 +1,4 @@
-"""将完整纯 JAX 文本训练参数逐叶同步到已有 Gemma4 NNX 推理模型。
+"""将 JAX 文本模型的各个参数数组同步到已有的 Gemma4 NNX 推理模型。
 
 只负责参数布局、BF16 转换和同步传输。调用方须先排空请求并释放旧 KV，随后统一
 刷新 runner.state/state_leaves、重建 KV 和提交版本。此模块不导入 tpu-inference。
@@ -174,7 +174,7 @@ def _make_plan(
     expected_sources = dict(_source_leaves(params))
     consumed = [name for item in plan for name, _ in item.sources]
     if Counter(consumed) != Counter(expected_sources.keys()):
-        raise ValueError("训练参数树没有被完整且恰好一次覆盖")
+        raise ValueError("权重映射必须使用全部训练参数，每个参数恰好使用一次")
     for name, value in expected_sources.items():
         if str(value.dtype) != "float32":
             raise ValueError(f"训练 master 必须保持 FP32: {name}={value.dtype}")
@@ -239,7 +239,7 @@ def apply_gemma4_params(runner: Any, params: Gemma4TextParams, config: Gemma4Tex
         if type(model).__name__ != "Gemma4ForConditionalGeneration":
             raise ValueError("仅支持已资格验证的 Gemma4ForConditionalGeneration")
         if hasattr(model, "lm_head"):
-            raise ValueError("训练参数树只支持 tied embedding，不能遗漏独立 lm_head")
+            raise ValueError("当前权重映射只支持共享输入输出权重，不能忽略独立的 lm_head")
         pairs = list(model.named_parameters())
         named = dict(pairs)
         if len(named) != len(pairs):

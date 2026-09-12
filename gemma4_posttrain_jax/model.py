@@ -88,11 +88,11 @@ def _hf_attention_dimensions(text: Mapping[str, Any], layer_types: list[str]) ->
             raise ValueError("逐层attention维度必须为正，且KV头数须整除query头数")
         dimensions[layer_type].add((dim, heads))
     if any(len(values) > 1 for values in dimensions.values()):
-        raise ValueError("同一attention类型的逐层维度不一致，当前参数树不能表示")
+        raise ValueError("同一种 attention 在不同层的维度不一致，当前参数结构不支持这种配置")
     head_dim, kv_heads = next(iter(dimensions[SLIDING]), (head_dim, kv_heads))
     global_dim, full_kv = next(iter(dimensions[FULL]), (head_dim, kv_heads))
     if full_kv != kv_heads and not text.get("attention_k_eq_v", False):
-        raise ValueError("当前参数树仅在K=V全局attention路径支持独立KV头数")
+        raise ValueError("当前实现仅在 K=V 的全局 attention 中支持单独设置 KV 头数")
     global_kv = full_kv if full_kv != kv_heads else None
     return head_dim, global_dim, kv_heads, global_kv
 

@@ -47,7 +47,7 @@ def test_wandb_adapter_forwards_config_metrics_and_finish() -> None:
     fake_wandb = FakeWandb(fake_run)
     tracker = init_tracker(
         enabled=True,
-        project="gemma4-rl-jax",
+        project="gemma4_posttrain_jax",
         run_name="offline-smoke",
         tags=("phase2.5", "tpu-v4"),
         config={"batch_size": 8},
@@ -58,7 +58,7 @@ def test_wandb_adapter_forwards_config_metrics_and_finish() -> None:
     tracker.finish()
 
     assert fake_wandb.init_kwargs == {
-        "project": "gemma4-rl-jax",
+        "project": "gemma4_posttrain_jax",
         "name": "offline-smoke",
         "tags": ["phase2.5", "tpu-v4"],
         "config": {"batch_size": 8},

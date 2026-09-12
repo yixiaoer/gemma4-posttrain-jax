@@ -150,7 +150,7 @@ def parse_args() -> argparse.Namespace:
         "--save-at-steps", type=int, nargs="+", help="只在指定完整rollout更新边界保存；与save-every互斥"
     )
     parser.add_argument(
-        "--audit-final-state", action="store_true", help="逐叶保存最终master/Adam内容摘要，供独立恢复核对"
+        "--audit-final-state", action="store_true", help="记录最终模型参数和 Adam 状态的校验值，用于检查恢复结果"
     )
     parser.add_argument("--audit-update-state", action="store_true", help="每步记录少量可训练参数的真实变化")
     parser.add_argument(
@@ -168,7 +168,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dev-seed", type=int, default=0)
     parser.add_argument("--eval-split", choices=("test", "train-dev"), default="test")
     parser.add_argument("--wandb", action="store_true", help="启用 host 侧 W&B；离线设 WANDB_MODE=offline")
-    parser.add_argument("--wandb-project", default="gemma4-posttrain-jax")
+    parser.add_argument("--wandb-project", default="gemma4_posttrain_jax")
     parser.add_argument("--wandb-run-name")
     parser.add_argument("--wandb-tags", nargs="*", default=())
     return parser.parse_args()
@@ -584,7 +584,7 @@ def main() -> None:
         str(args.model_path), dtype=jnp.float32 if lora_config is None else jnp.bfloat16
     )
     params = shard_gemma4_text_params(host_params, config, mesh)
-    # 参考模型始终来自初始 checkpoint，不随策略更新；beta=0 时不建立此树。
+    # 参考模型始终来自初始 checkpoint，不随策略更新；beta=0 时不加载参考模型参数。
     reference_host = None
     if args.beta:
         with jax.default_device(jax.devices("cpu")[0]):
@@ -1407,7 +1407,7 @@ def main() -> None:
         final_audit = summarize_train_state(state)
         write_json(args.output_dir / "final_state_audit.json", final_audit)
         if not final_audit["all_finite"]:
-            raise RuntimeError("最终训练状态存在非有限叶；完整摘要已保存")
+            raise RuntimeError("最终训练状态包含非有限值；检查结果已保存")
     write_json(
         args.output_dir / "summary.json",
         {

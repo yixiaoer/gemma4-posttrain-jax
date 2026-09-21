@@ -91,6 +91,26 @@ EXPECTED_SOURCE_SHA256 = {
 }
 
 
+def resolve_weight_sync_transport(backend: str, transport: str = "auto") -> str:
+    """同进程默认用 ICI；独立运行时保留主机协议，不静默回退。"""
+    if backend not in ("jax", "inference", "inference-process", "inference-distributed") or transport not in (
+        "auto",
+        "host",
+        "device",
+    ):
+        raise ValueError("未知 rollout 后端或权重同步方式")
+    resolved = (
+        ("device" if backend in ("inference", "inference-distributed") else "host")
+        if transport == "auto"
+        else transport
+    )
+    if resolved == "device" and backend not in ("inference", "inference-distributed"):
+        raise ValueError("device 权重直传要求同进程 inference 或共同运行时 inference-distributed")
+    if backend == "inference-distributed" and resolved != "device":
+        raise ValueError("共同运行时只使用 device；独立运行时 host 对照使用 inference-process")
+    return resolved
+
+
 @dataclass(frozen=True)
 class EngineConfig:
     model_path: str
@@ -104,6 +124,22 @@ class EngineConfig:
     block_size: int = 64
     kernel_route: str = "batched"
     max_logprobs: int = 128
+    weight_sync_transport: str = "device"
+    source_read_mode: str = "direct"
+    trim_training_host_allocator_after_transfer: bool = False
+    trim_host_allocator_after_update: bool = False
+
+    def __post_init__(self) -> None:
+        if self.weight_sync_transport not in ("host", "device"):
+            raise ValueError("weight_sync_transport 必须为 host 或 device")
+        if self.source_read_mode not in ("direct", "transient_copy"):
+            raise ValueError("source_read_mode必须是direct或transient_copy")
+        if type(self.trim_training_host_allocator_after_transfer) is not bool:
+            raise ValueError("trim_training_host_allocator_after_transfer必须是bool")
+        if type(self.trim_host_allocator_after_update) is not bool:
+            raise ValueError("trim_host_allocator_after_update必须是bool")
+        if self.trim_training_host_allocator_after_transfer and self.source_read_mode != "transient_copy":
+            raise ValueError("训练侧分配器回收只允许与transient_copy一起启用")
 
 
 @dataclass(frozen=True)
@@ -481,7 +517,7 @@ class EngineRuntime:
                             list(prompt), list(item.token_ids), raw, proposal, item.finish_reason, item.stop_reason
                         )
                     )
-                self.jax.effects_barrier()
+                self.jax.effects_barrier()  # type: ignore[no-untyped-call]
                 cleanup = self._ensure_quiescent()
                 rng_after, rng_placement = read_runner_rng(self.runner, self.config.device_indexes)
                 if rng_placement != rng_install["placement"]:
@@ -515,7 +551,7 @@ class EngineRuntime:
             raise RuntimeError("模型 state treedef 改变，不能复用已编译 model_fn")
         if [(tuple(leaf.shape), str(leaf.dtype)) for leaf in leaves] != expected_shapes:
             raise RuntimeError("模型 state shape/dtype 改变")
-        self.jax.block_until_ready(leaves)
+        self.jax.block_until_ready(leaves)  # type: ignore[no-untyped-call]
         expected_devices = set(self.config.device_indexes)
         if any({int(device.id) for device in leaf.sharding.device_set} != expected_devices for leaf in leaves):
             raise RuntimeError("同步后的模型数组不在指定引擎芯片上")
@@ -575,7 +611,7 @@ class EngineRuntime:
             raise RuntimeError("KV 恢复不完整")
         if any(array.is_deleted() for array in arrays):
             raise RuntimeError("恢复后的 KV 仍含已删除数组")
-        self.jax.block_until_ready(arrays)
+        self.jax.block_until_ready(arrays)  # type: ignore[no-untyped-call]
 
     def finish_update(self) -> dict[str, Any]:
         if self._pending is None or not self._pending["applied"]:
@@ -623,7 +659,12 @@ class EngineRuntime:
         """与独立进程后端共享完整参数接口，沿用原事务与映射实现。"""
         from .inference_weights import apply_gemma4_params
 
-        return self.update_weights(lambda runner: apply_gemma4_params(runner, params, model_config), version)
+        return self.update_weights(
+            lambda runner: apply_gemma4_params(
+                runner, params, model_config, transport=self.config.weight_sync_transport
+            ),
+            version,
+        )
 
     def update_weights(self, callback: Callable[[Any], dict[str, Any]], version: int | str) -> dict[str, Any]:
         started = time.perf_counter()

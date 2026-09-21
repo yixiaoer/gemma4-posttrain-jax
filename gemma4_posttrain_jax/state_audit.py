@@ -4,30 +4,47 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import closing
 from typing import Any, cast
 
 
 def summarize_train_state(state: Any) -> dict[str, Any]:
-    """依次读回各个数组，计算校验值后释放主机视图，保持设备状态不变。"""
+    """分块计算全部数组的内容摘要，避免大参数读回和源状态缓存累积。"""
     import jax
     import numpy as np
+
+    from gemma4_posttrain_jax import checkpoint
 
     records = []
     paths, treedef = jax.tree_util.tree_flatten_with_path(state)
     for path, leaf in paths:
-        value = np.asarray(jax.device_get(leaf), order="C")
-        finite = bool(np.isfinite(value).all())
-        record = {
-            "name": jax.tree_util.keystr(path),
-            "shape": list(value.shape),
-            "dtype": str(value.dtype),
-            "bytes": value.nbytes,
-            "sha256": hashlib.sha256(memoryview(value).cast("B")).hexdigest(),
-            "finite": finite,
-            "nonzero_elements": int(np.count_nonzero(value)),
-        }
-        records.append(record)
-        del value
+        signature = leaf if isinstance(leaf, jax.Array) else np.asarray(leaf)
+        finite, nonzero, byte_count = True, 0, 0
+        digest = hashlib.sha256()
+        with closing(checkpoint.iter_host_array_blocks(leaf, max_bytes=checkpoint._CHECKPOINT_CHUNK_BYTES)) as blocks:
+            for value in blocks:
+                flat = value.reshape(-1)
+                for start in range(0, flat.size, 2**20):
+                    part = flat[start : start + 2**20]
+                    finite = bool(np.isfinite(part).all()) and finite
+                    nonzero += int(np.count_nonzero(part))
+                    del part
+                digest.update(memoryview(flat.view(np.uint8)))
+                byte_count += value.nbytes
+                del flat, value
+        if byte_count != signature.size * signature.dtype.itemsize:
+            raise ValueError("完整状态检查的读回字节数与数组大小不同")
+        records.append(
+            {
+                "name": jax.tree_util.keystr(path),
+                "shape": list(signature.shape),
+                "dtype": str(signature.dtype),
+                "bytes": byte_count,
+                "sha256": digest.hexdigest(),
+                "finite": finite,
+                "nonzero_elements": nonzero,
+            }
+        )
     names = [row["name"] for row in records]
     if len(set(names)) != len(names):
         raise ValueError("训练状态中存在重名数组")

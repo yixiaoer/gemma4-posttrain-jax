@@ -1,8 +1,8 @@
-# 安装与使用
+# QuickStart
 
-这篇文档从安装开始，依次介绍文本生成、SFT、GRPO、保存和继续训练，以及数值与性能实验。所有命令都在仓库根目录运行。训练示例使用 Gemma 4 E2B 和四个 TPU v4 JAX 设备。
+这篇文档从安装开始，依次介绍文本生成、SFT、GRPO、保存和继续训练，以及测试与验证范围。所有命令都在仓库根目录运行。训练示例使用 Gemma 4 E2B 和四个 TPU v4 JAX 设备。
 
-## 准备环境和模型
+## 1. 搭环境
 
 需要 Python 3.12。建议为项目创建独立环境：
 
@@ -13,19 +13,23 @@ python3.12 -m venv .venv
 .venv/bin/python scripts/check_env.py --backend tpu
 ```
 
-只在 CPU 上开发或运行测试时，将安装选项换成 `.[hf,dev]`，然后执行：
+如果只在 CPU 上开发或跑测试，把安装选项换成 `.[hf,dev]`，检查时加前缀：
 
 ```bash
 JAX_PLATFORMS=cpu .venv/bin/python scripts/check_env.py --backend cpu
 ```
 
-CPU 模式检查版本和矩阵计算；TPU 模式还会运行一个小型 Pallas kernel。脚本支持 `--help`，查看帮助不会执行设备任务。
+CPU 模式只检查版本和矩阵计算；TPU 模式还会跑一个小 Pallas kernel。
 
-训练需要下载好的 `google/gemma-4-E2B-it` 模型目录，其中应包含配置、tokenizer 和 safetensors 权重。下面用 `/path/to/e2b-snapshot` 代指这个目录，运行前请替换成实际的绝对路径。
+以上安装用于原生 JAX 路径。tpu-inference 适配层依赖固定版本与源码，不能直接在引擎环境执行这组升级命令。同进程 ICI 和双进程接口的适用范围见[整体设计](design-overview.md)；它们仍属于实验配置。
 
-SFT 短测试使用脚本内置的一道问答，无需下载训练数据；GRPO 示例使用 GSM8K。首次读取缺少的数据时，Hugging Face 工具可能联网下载；已有完整缓存时，可以设置 `HF_HUB_OFFLINE=1` 和 `HF_DATASETS_OFFLINE=1`。本仓库不包含模型权重。
+**模型准备：** 下载 `google/gemma-4-E2B-it` 到本地目录（需包含配置、tokenizer、safetensors 权重）。下文统一用 `/path/to/e2b-snapshot` 指代，运行前替换成实际路径。
 
-## 生成回答
+**数据：** SFT 短测试自带内置问答，不需要额外数据。GRPO 用 GSM8K，首次运行会自动下载；如果已有缓存，可设 `HF_HUB_OFFLINE=1` 和 `HF_DATASETS_OFFLINE=1` 离线运行。
+
+## 2. 生成回答
+
+最简单的 greedy 生成：
 
 ```bash
 .venv/bin/python scripts/generate.py \
@@ -33,7 +37,7 @@ SFT 短测试使用脚本内置的一道问答，无需下载训练数据；GRPO
   --prompt "计算3乘4再加2。" --max-new-tokens 64
 ```
 
-默认使用 greedy，即每一步选择分数最高的 token。随机生成可以设置温度、TopK、Top-p 和随机种子；重复传入 `--prompt` 可以一次生成多条回答：
+加上采样参数，或一次传多条 prompt：
 
 ```bash
 .venv/bin/python scripts/generate.py \
@@ -43,82 +47,101 @@ SFT 短测试使用脚本内置的一道问答，无需下载训练数据；GRPO
   --max-new-tokens 128
 ```
 
-`--top-k 0 --top-p 1` 关闭候选截断。`--compare-hf` 会同时用 Transformers 在 CPU 上加载模型并显示结果，需要额外的内存。两个框架的随机数实现不同，即使用相同的随机种子，随机生成的回答也可能不同。
+几个实用选项：`--top-k 0 --top-p 1` 关闭候选截断；`--compare-hf` 同时用 Transformers 在 CPU 上跑一遍对比（需要额外内存，且两个框架随机数实现不同，同种子结果可能不一样）。
 
-## 运行 SFT
+## 3. 运行 SFT
 
 ```bash
 bash examples/e2b_sft_smoke.sh /path/to/e2b-snapshot /path/to/new-sft
 ```
 
-这个示例用于快速检查训练能否正常执行。脚本内置了一道计算球数的问答：三排红球，每排四个，再加两个蓝球，答案是 14。它将这道问答重复四份，组成 batch size 为 4 的输入，适配四个 TPU 设备；每行长度补齐或截断到 128 token。
+这是一个快速示例测试，用来确认训练流程能跑通。
 
-这里的一个“训练步”包括以下操作：
+**它做了什么：** 脚本内置一道球数计算题（三排红球×4 + 两个蓝球 = 14），复制 4 份凑成 batch size 4（对应 4 块 TPU），序列长度统一到 128 token，然后在这同一批数据上连跑 4 步。
 
-1. 用当前模型参数计算答案的 loss，衡量模型对给定答案的预测误差。
-2. 对 loss 求梯度，得到各个可训练参数的调整依据。
-3. Adam 根据梯度和之前保存的优化器状态修改参数，供下一步使用。
+**每一步的含义：**
+1. 前向传播，算出答案部分的 loss（模型预测与正确答案的差距）。
+2. 反向传播，得到各可训练参数的梯度。
+3. Adam 优化器根据梯度和历史状态更新参数。
 
-脚本对同一批输入连续执行 4 个训练步。固定输入便于检查 loss 的变化；连续执行几步可以检查参数和优化器状态能否继续使用，以及后续步骤是否复用已有的编译结果。4 是短测试选定的步数，没有特殊的算法含义。
+固定输入是为了观察 loss 变化；跑多步是为了验证参数/优化器状态能正确传递，以及后续步骤复用编译缓存。4 步只是测试选的数字，没有特殊含义。
 
-配置使用学习率 `1e-4`，冻结 embedding，不使用重计算。结果写入 `metrics.csv`，包含每一步的 loss、梯度范数和耗时。需要在 GSM8K 上训练时，直接使用 `scripts/train_sft.py` 并省略 `--overfit-one-batch`。
+**配置：** 学习率 `1e-4`，冻结 embedding，不用重计算。结果写入 `metrics.csv`（含每步 loss、梯度范数、耗时）。
 
-这个短测试默认不保存训练状态。需要保存或继续训练时，在 `scripts/train_sft.py` 中设置 `--save-every`、`--checkpoint-dir` 和 `--resume`。
+**正式训练 GSM8K：** 直接用 `scripts/train_sft.py`，去掉 `--overfit-one-batch`。
 
-两个 shell 示例默认使用仓库的 `.venv/bin/python`。如果已有其他 Python 环境，可以通过 `PYTHON_BIN=/absolute/path/to/python` 指定解释器。
+**保存和续训：** 冒烟测试默认不保存。需要时在 `scripts/train_sft.py` 里加 `--save-every`、`--checkpoint-dir`、`--resume`。
 
-## 运行 GRPO，并检查保存和恢复
+**换 Python 解释器：** 两个 shell 示例默认用 `.venv/bin/python`，可通过 `PYTHON_BIN=/absolute/path/to/python` 覆盖。
+
+
+## 4. 运行 GRPO + 断点恢复验证
 
 ```bash
 bash examples/e2b_grpo_recovery.sh /path/to/e2b-snapshot /path/to/new-grpo
 ```
 
-这个示例检查中断后继续训练能否得到与连续训练一致的结果。每个训练步仍以 Adam 完成一次参数修改为结束；与 SFT 不同，GRPO 的训练数据来自模型生成的回答及其奖励。示例执行以下步骤：
+这个示例的核心目的是验证：中断后恢复训练，结果与连续训练完全一致。
 
-1. 从初始模型训练到第 4 步，在第 2、4 步保存完整状态。
-2. 启动新的 Python 进程，加载第 2 步状态，继续训练到第 4 步。
-3. 在另外两个进程中，分别加载连续训练和恢复训练的末步状态，在相同的四道题上生成回答。
-4. 比较最终参数、Adam 状态、随机状态、数据读取位置，以及恢复后生成的所有样本和评估结果。
+**流程：**
+1. 从初始模型训练 4 步，在第 2、4 步保存完整状态。
+2. 新进程加载第 2 步状态，继续训练到第 4 步。
+3. 两个进程分别加载连续训练和恢复训练的末步状态，在相同 4 道题上生成回答。
+4. 逐项比较：最终参数、Adam 状态、随机状态、数据读取位置、生成样本、评估结果。
 
-这里每轮取 2 道题，每题生成 4 个回答；prompt 最长 512 token，回答最多 256 token，训练 microbatch 为 4。学习率为 `1e-6`，KL 系数为 0，冻结 embedding，开启重计算，使用随机种子 0。动态补采最多尝试 16 次；未进入更新的样本也会记录，用于检查恢复后随机数和数据顺序是否一致。
+**训练配置：** 每轮 2 道题 × 4 个回答，prompt ≤ 512 token，回答 ≤ 256 token，microbatch 4。学习率 `1e-6`，KL 系数 0，冻结 embedding，开启重计算，seed 0。动态补采最多 16 次；未参与更新的样本也会记录（用于校验随机数和数据顺序）。
 
-评估题来自预先划出的 500 道题，与训练题分开。四题评估用于检查模型是否正确保存和恢复，不能据此判断训练质量。
+**评估：** 用预先划出的 500 题，取 4 题检查模型是否正确保存和恢复——不能据此判断训练质量。
 
-### 空间与输出
+### KL 计算
 
-输出目录必须不存在。三个状态文件合计约 100.59 GB，也就是 93.69 GiB；加上其他输出，建议预留至少 100 GiB 可写空间。如果输出位于 tmpfs，文件还会占用主机内存。这次实际运行的进程组内存峰值约 186.77 GiB，具体需要多少内存取决于模型、输入形状和运行环境。
+默认 `--beta 0`，不算 KL。需要时设正数，如 `--beta 0.04`。
 
-```text
+公式采用 K3：令 `d = reference_logprob - policy_logprob`，KL = `exp(d) - d - 1`。数值处理上，接近零时用多项式近似，范围外用高精度 `expm1`，以减小相减误差和 TPU 默认近似的偏差。
+
+可选 `--kl-clamp-value 10000` 对每个 token 的 KL 设上限（超限后该 token 的 KL 梯度为零，指数溢出前就会处理）。这和接近零的数值修正是两个独立选项。上限必须为正有限数、不超过 FP32 最大值，且只能搭配正 `beta` 使用。
+
+**旧状态兼容：** 新状态会记录 K3 版本和上限值。旧 `beta=0` 状态缺这两个字段时，按原逻辑（不用 KL）继续训练。旧的非零 KL 状态如果版本缺失或不匹配，会拒绝续训——要继续原实验，请用保存该状态的代码。
+
+### 磁盘和内存
+
+输出目录必须不存在。三个状态文件合计约 100.59 GB（93.69 GiB），加上其他输出，建议预留 ≥ 100 GiB。如果输出在 tmpfs 上，文件还会占主机内存。实测进程组内存峰值约 186.77 GiB（具体取决于模型、输入形状和环境）。
+
+### 输出结构
+
+```
 new-grpo/
-  baseline/                   连续训练的配置、指标、样本和参数变化记录
-  baseline-checkpoints/       第 2、4 步的完整状态
-  resume/                     恢复后第 3、4 步的训练记录
-  resume-checkpoints/         恢复训练的第 4 步状态
+  baseline/                   连续训练记录（配置、指标、样本、参数变化）
+  baseline-checkpoints/       第 2、4 步完整状态
+  resume/                     恢复后第 3、4 步训练记录
+  resume-checkpoints/         恢复训练第 4 步状态
   eval-baseline/evaluation/   连续训练模型的逐题预测和评分
   eval-resume/evaluation/     恢复训练模型的逐题预测和评分
-  recovery_check.json         两次训练的比较结果
+  recovery_check.json         比较结果（所有检查通过时 complete: true）
 ```
 
-`recovery_check.json` 只有在所有检查通过后才会写出 `complete: true`。如果运行中断，保留已有输出供排查，再次执行整个示例时使用新的目录。
+运行中断的话，保留已有输出排查问题，再跑用新目录。
 
-### 检查或继续已有训练
+### 重新比较 / 手动续训
 
-可以在完成的示例上重新比较结果，将新报告写到其他路径：
+对已完成的示例重新跑比较：
 
 ```bash
 .venv/bin/python scripts/compare_recovery.py /path/to/new-grpo \
   --rescore --output /path/to/new-recovery-check.json
 ```
 
-比较还会核对生成记录的必需字段、四道评估题的身份与完整性，以及评估是否加载了第 4 步模型。`--rescore` 使用本地 tokenizer，从记录的实际 token 重新解码和评分。比较脚本不会重新训练模型，但会读取三个大状态文件。
+`--rescore` 会用本地 tokenizer 从记录的 token ID 重新解码评分。比较脚本不会重新训练，但会读取三个大状态文件。
 
-手动使用训练脚本时，`--resume` 指向某一步的完整目录，例如 `step_00000002`。`--max-steps 4` 表示训练到全局第 4 步，而不是恢复后额外训练四步。恢复时需要保持模型、数据选择、采样方式和训练设置一致；脚本会检查这些配置。
+手动续训时，`--resume` 指向具体步骤目录（如 `step_00000002`），`--max-steps 4` 是全局步数上限（不是恢复后再跑 4 步）。恢复要求模型、数据、采样和训练配置一致，脚本会检查。
 
-SFT 和 GRPO 示例分别从初始模型开始。将 SFT 的训练结果作为 RL 起点，需要处理模型权重和任务状态的转换，当前示例没有自动完成这一步。
+**注意：** SFT 和 GRPO 示例各自从初始模型开始。把 SFT 结果接到 GRPO 需要手动处理权重和状态转换，示例没有自动完成这一步。
 
-## 单独评估模型
+---
 
-例如，评估刚才得到的第 4 步状态：
+## 5. 单独评估
+
+例如评估 GRPO 第 4 步：
 
 ```bash
 .venv/bin/python scripts/evaluate_gsm8k.py \
@@ -128,25 +151,31 @@ SFT 和 GRPO 示例分别从初始模型开始。将 SFT 的训练结果作为 R
   --max-prompt-len 512 --max-new-tokens 256 --reward-workers 2
 ```
 
-评估输出包含逐题回答、标准答案、评分、生成长度和实际 token ID。脚本还支持初始模型与 MATH 数据，完整参数可通过 `--help` 查看。
+输出包含逐题回答、标准答案、评分、生成长度和 token ID。也支持初始模型和 MATH 数据，详见 `--help`。
 
-## 运行数值与性能实验
+---
 
-以下三个实验使用脚本生成的小型输入，不需要下载模型：
+## 6. 测试与验证范围
 
-| 脚本 | 检查内容 |
-|---|---|
-| `scripts/probe_vocab_logprob.py` | 自动分片与词表并行的 loss、梯度和设备通信 |
-| `scripts/probe_sampling_math.py` | 默认归一化与高精度归一化的 logprob 误差 |
-| `scripts/probe_weight_checks.py` | BF16 数值检查与位检查的行为和耗时 |
-
-例如，在 CPU 上比较两种采样概率计算方法：
+安装 `.[hf,dev]` 后，可以在 CPU 上运行核心测试：
 
 ```bash
-JAX_PLATFORMS=cpu .venv/bin/python scripts/probe_sampling_math.py \
-  --backend cpu --save-ir --output-dir outputs/sampling-cpu
+JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 \
+  .venv/bin/python -m pytest -m 'not tpu and not full_model'
 ```
 
-结果写入指定目录的 `summary.json`；`--save-ir` 还会导出 StableHLO 和优化后的 HLO，用于分析编译器如何处理这些计算。输出目录必须不存在，便于保留不同运行的结果。
+四个 CPU 虚拟设备用于检查分片规则和设备间数据一致性，不能代表 TPU 性能。部分 Linux 进程测试在其他系统上跳过；要求恰好两个设备的 RNG 测试可单独运行：
 
-另外两个脚本的完整命令、实验设计和结果解释见[实验结果与分析](development-results.md)的对应章节。词表并行小实验需要四个 CPU 虚拟设备或四个 TPU 设备；BF16 检查仅使用 CPU。
+```bash
+JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=2 \
+  .venv/bin/python -m pytest tests/test_inference_rng.py
+```
+
+本批迁移后的 ICI、BF16 内容与分块保存已在真实四芯 TPU v4 上通过 59 项数组检查。它们覆盖传输内容、浮点转换、分片方向、保存字节和失败条件，不加载 E2B。运行相同检查：
+
+```bash
+JAX_PLATFORMS=tpu,cpu .venv/bin/python -m pytest \
+  tests/test_inference_device.py tests/test_checkpoint_chunks.py
+```
+
+完整 E2B 训练、保存与独立续训应另外运行前面的恢复示例。已有历史实验不自动覆盖迁移后的代码，尤其非零 KL 的训练需要按当前数学实现重新验证。

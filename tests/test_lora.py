@@ -29,7 +29,7 @@ from gemma4_posttrain_jax.weights import convert_gemma4_text_params
 
 @pytest.fixture(params=[TINY_A, TINY_B], ids=["ple-shared-kv", "12b-k-equals-v"])
 def lora_fixture(request):
-    # 复用已有HF小模型fixture构造器；小权重便于严格反向比较，不初始化产品基础模型。
+    # 复用已有HF小模型fixture构造器；小权重便于严格反向比较，不初始化基础模型。
     model = build_hf_model(request.param, seed=7, weight_std=0.03, norm_std=0.05, layer_scalar_min=0.95)
     config = config_from_hf(request.param)
     base = convert_gemma4_text_params(model.state_dict().__getitem__, config)

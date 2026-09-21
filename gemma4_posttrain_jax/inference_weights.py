@@ -212,7 +212,9 @@ def _host_bf16(item: _Mapping) -> np.ndarray:
     return np.ascontiguousarray(result)
 
 
-def apply_gemma4_params(runner: Any, params: Gemma4TextParams, config: Gemma4TextConfig) -> dict[str, Any]:
+def apply_gemma4_params(
+    runner: Any, params: Gemma4TextParams, config: Gemma4TextConfig, *, transport: str = "host"
+) -> dict[str, Any]:
     """更新已有 runner.model 的完整有效文本参数；保留原分片、Param对象和FP32 master。
 
     成功后缓存 state_leaves 仍由调用方刷新。失败时恢复已经替换的 Param 原数组，
@@ -222,12 +224,15 @@ def apply_gemma4_params(runner: Any, params: Gemma4TextParams, config: Gemma4Tex
     from flax import nnx
     from ml_dtypes import bfloat16
 
+    if transport not in ("host", "device"):
+        raise ValueError("transport 必须为 host 或 device")
     report: dict[str, Any] = {
         "complete": False,
         "stage": "validate",
         "updated": [],
         "preserved": [],
         "dispatch_refresh_required": True,
+        "transport": transport,
         "scope": "完整有效文本 FP32 master 到 BF16 NNX 参数；KV共享死参数与视觉参数原样保留。",
     }
     originals: dict[str, Any] = {}
@@ -301,8 +306,15 @@ def apply_gemma4_params(runner: Any, params: Gemma4TextParams, config: Gemma4Tex
         report["model_parameter_count"] = len(named)
         for item in plan:
             report["stage"] = item.name
-            host = _host_bf16(item)
-            incoming = jax.device_put(host, originals[item.name].sharding)
+            device_check = None
+            host = None
+            if transport == "device":
+                from .inference_device import transfer_device_weight
+
+                incoming, device_check = transfer_device_weight(item, originals[item.name].sharding)
+            else:
+                host = _host_bf16(item)
+                incoming = jax.device_put(host, originals[item.name].sharding)
             jax.block_until_ready(incoming)
             if (
                 incoming.dtype != originals[item.name].dtype
@@ -312,12 +324,13 @@ def apply_gemma4_params(runner: Any, params: Gemma4TextParams, config: Gemma4Tex
                 raise ValueError(f"传输改变目标 dtype/shape/sharding: {item.name}")
             shard_checks = []
             for shard in incoming.addressable_shards:
-                actual = np.asarray(jax.device_get(shard.data))
-                expected = host[shard.index]
-                if not bf16_bits_equal(actual, expected):
-                    raise ValueError(f"实际设备分片与 BF16 输入不同: {item.name}, device={shard.device.id}")
-                shard_checks.append({"device_id": int(shard.device.id), "shape": list(actual.shape), "exact": True})
-                del actual, expected
+                if host is not None:
+                    actual = np.asarray(jax.device_get(shard.data))
+                    expected = host[shard.index]
+                    if not bf16_bits_equal(actual, expected):
+                        raise ValueError(f"实际设备分片与 BF16 输入不同: {item.name}, device={shard.device.id}")
+                    del actual, expected
+                shard_checks.append({"device_id": int(shard.device.id), "shape": list(shard.data.shape), "exact": True})
             written.append(item.name)
             named[item.name].set_value(incoming)
             report["updated"].append(
@@ -326,9 +339,14 @@ def apply_gemma4_params(runner: Any, params: Gemma4TextParams, config: Gemma4Tex
                     "sources": [name for name, _ in item.sources],
                     "layout": item.layout,
                     "merged_shards": item.shards,
-                    "shape": list(host.shape),
+                    "shape": list(item.shape),
                     "dtype": "bfloat16",
-                    "host_sha256": hashlib.sha256(memoryview(host.view(np.uint8)).cast("B")).hexdigest(),
+                    "host_sha256": (
+                        hashlib.sha256(memoryview(host.view(np.uint8)).cast("B")).hexdigest()
+                        if host is not None
+                        else None
+                    ),
+                    "device_check": device_check,
                     "addressable_shards": shard_checks,
                     "new_array": incoming is not originals[item.name],
                 }

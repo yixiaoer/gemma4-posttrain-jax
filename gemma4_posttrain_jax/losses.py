@@ -358,15 +358,41 @@ def _masked_mean(values: Array, mask: Array) -> Array:
     return (values * cast_mask).sum() / jnp.maximum(cast_mask.sum(), 1)
 
 
-def _kl_estimate(policy_logps: Array, reference_logps: Array, estimator: str) -> Array:
-    if estimator in ("k1", "kl"):
-        return policy_logps - reference_logps
-    if estimator in ("k2", "mse_kl"):
-        return 0.5 * jnp.square(policy_logps - reference_logps)
+def _stable_k3(difference: Array) -> Array:
+    """避免接近零时的相减误差，以及未选中多项式分支的梯度溢出。"""
+
+    small = jnp.abs(difference) <= 0.01
+    local = jnp.where(small, difference, 0.0)
+    polynomial = jnp.square(local) * (0.5 + local * (1.0 / 6.0 + local * (1.0 / 24.0 + local / 120.0)))
+    outer = lax.expm1(difference, accuracy=lax.AccuracyMode.HIGHEST) - difference
+    return jnp.where(small, polynomial, outer)
+
+
+def _kl_estimate(
+    policy_logps: Array,
+    reference_logps: Array,
+    estimator: str,
+    *,
+    clamp_value: float | None = None,
+) -> Array:
     if estimator in ("k3", "low_var_kl"):
         difference = reference_logps - policy_logps
-        return jnp.exp(difference) - difference - 1.0
-    raise ValueError(f"unsupported KL estimator: {estimator}")
+        if clamp_value is not None:
+            # 比此值更大的下一个FP32数，其指数已经超出FP32范围。
+            # 先隔离溢出分支，避免最终clip的零梯度乘上无穷大而产生NaN。
+            max_log = jnp.nextafter(jnp.log(jnp.finfo(jnp.float32).max), -jnp.inf)
+            overflow = difference > max_log
+            safe_difference = jnp.where(overflow, 0.0, difference)
+            estimate = jnp.clip(_stable_k3(safe_difference), -clamp_value, clamp_value)
+            return jnp.where(overflow, clamp_value, estimate)
+        estimate = _stable_k3(difference)
+    elif estimator in ("k1", "kl"):
+        estimate = policy_logps - reference_logps
+    elif estimator in ("k2", "mse_kl"):
+        estimate = 0.5 * jnp.square(policy_logps - reference_logps)
+    else:
+        raise ValueError(f"unsupported KL estimator: {estimator}")
+    return estimate if clamp_value is None else jnp.clip(estimate, -clamp_value, clamp_value)
 
 
 def grpo_loss(
@@ -380,6 +406,7 @@ def grpo_loss(
     eps_high: float = 0.2,
     beta: float = 0.0,
     kl_estimator: Literal["k1", "k2", "k3", "kl", "mse_kl", "low_var_kl"] = "k3",
+    kl_clamp_value: float | None = None,
     agg_mode: str = "sequence-mean-token-mean",
     ratio_level: Literal["token", "sequence"] = "token",
     dual_clip_c: float | None = None,
@@ -410,6 +437,10 @@ def grpo_loss(
         raise ValueError("sampler IS权重必须与policy logps共享[B,N]")
     if eps_low < 0 or eps_high < 0 or beta < 0:
         raise ValueError("eps_low, eps_high, and beta must be non-negative")
+    if kl_clamp_value is not None and (
+        not math.isfinite(kl_clamp_value) or kl_clamp_value <= 0 or kl_clamp_value > float(jnp.finfo(jnp.float32).max)
+    ):
+        raise ValueError("kl_clamp_value must be a positive finite float32 value")
     if dual_clip_c is not None and dual_clip_c <= 0:
         raise ValueError("dual_clip_c must be positive")
     if ratio_level not in ("token", "sequence"):
@@ -449,7 +480,9 @@ def grpo_loss(
     if reference_logps is None:
         kl_loss = jnp.zeros((), jnp.float32)
     else:
-        per_token_kl = _kl_estimate(policy, reference_logps.astype(jnp.float32), kl_estimator)
+        per_token_kl = _kl_estimate(
+            policy, reference_logps.astype(jnp.float32), kl_estimator, clamp_value=kl_clamp_value
+        )
         kl_loss = aggregate_token_loss(per_token_kl, mask, agg_mode, token_scale=token_scale)
     loss = policy_loss + beta * kl_loss
     broadcast_advantage = jnp.broadcast_to(advantage, policy.shape)
@@ -629,6 +662,7 @@ def grpo_train_step[Params](
     eps_high: float = 0.2,
     beta: float = 0.0,
     kl_estimator: Literal["k1", "k2", "k3", "kl", "mse_kl", "low_var_kl"] = "k3",
+    kl_clamp_value: float | None = None,
     agg_mode: str = "sequence-mean-token-mean",
     ratio_level: Literal["token", "sequence"] = "token",
     dual_clip_c: float | None = None,
@@ -698,6 +732,7 @@ def grpo_train_step[Params](
             eps_high=eps_high,
             beta=beta,
             kl_estimator=kl_estimator,
+            kl_clamp_value=kl_clamp_value,
             agg_mode=agg_mode,
             ratio_level=ratio_level,
             dual_clip_c=dual_clip_c,

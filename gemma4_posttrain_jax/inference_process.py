@@ -19,7 +19,9 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from .inference_runtime import BatchRngState, EngineConfig, EngineRuntime, EngineSampling
+from .host_memory import trim_host_allocator
+from .inference_rng import BatchRngState
+from .inference_runtime import EngineConfig, EngineRuntime, EngineSampling
 from .inference_wire import (
     PROTOCOL,
     WireError,
@@ -239,7 +241,13 @@ def serve(path: Path, engine_config: EngineConfig, record_path: Path) -> None:
                         transport["device_commit"] = True
                         update["host_transport"] = transport
                         del params
-                        gc.collect()
+                        collected = gc.collect()
+                        update["host_cleanup"] = {
+                            "gc_collected": collected,
+                            "allocator_trim": trim_host_allocator()
+                            if engine_config.trim_host_allocator_after_update
+                            else {"enabled": False},
+                        }
                         report["memory_snapshots"].append(snapshot_device_memory(devices, f"update_{version}"))
                         entry.update(complete=True, version=version, wall_s=time.perf_counter() - started)
                         save()

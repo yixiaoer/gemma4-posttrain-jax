@@ -127,7 +127,7 @@ def check_joint_old_replay(grad_tiny, algorithm, cap, *, mesh=None) -> None:
 
     weights = None
     if cap is not None:
-        # 独立NumPy公式；不是再调用产品TIS函数作为oracle。
+        # 独立NumPy公式；不是再调用TIS函数作为oracle。
         expected_weights = np.where(np.asarray(mask), np.minimum(np.exp(anchor_host - np.asarray(behavior)), cap), 0)
         assert np.any(expected_weights[np.asarray(mask)] == cap)
         assert np.any((expected_weights > 0) & (expected_weights < cap))

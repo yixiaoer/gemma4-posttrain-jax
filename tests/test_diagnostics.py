@@ -10,10 +10,35 @@ import pytest
 
 from gemma4_posttrain_jax.diagnostics import (
     array_drift_metrics,
+    checkpoint_storage,
+    logprob_drift_gate,
     logprob_drift_metrics,
     optional_package_version,
     source_git_state,
 )
+
+
+def test_checkpoint_storage_resolves_symlinks_and_longest_mount(tmp_path):
+    disk = tmp_path / "disk"
+    ram = disk / "runtime state"
+    ram.mkdir(parents=True)
+    alias = tmp_path / "checkpoint-link"
+    alias.symlink_to(ram, target_is_directory=True)
+    escaped = str(ram).replace(" ", r"\040")
+    mounts = f"1 0 8:1 / / rw - ext4 /dev/root rw\n2 1 0:2 / {escaped} rw - tmpfs tmpfs rw\n"
+    assert checkpoint_storage(alias / "future-save", mountinfo=mounts) == {
+        "path": str(ram / "future-save"),
+        "mount_point": str(ram),
+        "filesystem": "tmpfs",
+        "memory_backed": True,
+    }
+    assert checkpoint_storage(disk / "future-save", mountinfo=mounts)["memory_backed"] is False
+    assert checkpoint_storage(disk / "runtime state-other", mountinfo=mounts)["filesystem"] == "ext4"
+
+
+def test_checkpoint_storage_keeps_unknown_storage_unknown(tmp_path):
+    assert checkpoint_storage(None) is None
+    assert checkpoint_storage(tmp_path, mountinfo="not a mount record")["memory_backed"] is None
 
 
 def test_source_identity_uses_source_root_and_rejects_unrelated_parent_repo(tmp_path, monkeypatch):
@@ -97,3 +122,32 @@ def test_drift_metrics_reject_shape_and_empty_mask() -> None:
             np.zeros((2,), dtype=np.bool_),
             delta_definition="actual-expected",
         )
+
+
+def test_logprob_drift_gate_does_not_change_recovery_control_flow() -> None:
+    failed_metrics = {"ratio_p01": 0.88, "ratio_p99": 1.11}
+    initial = logprob_drift_gate(failed_metrics, start_step=0)
+    assert initial == {
+        "protocol": "startup-logprob-drift-gate-v2",
+        "start_step": 0,
+        "ratio_lower": 0.9,
+        "ratio_upper": 1.1,
+        "ratio_p01": 0.88,
+        "ratio_p99": 1.11,
+        "passed": False,
+        "enforced": True,
+        "action": "stop-before-update",
+        "reason": "initial-backend-admission",
+    }
+    resumed = logprob_drift_gate(failed_metrics, start_step=2)
+    assert not resumed["passed"]
+    assert not resumed["enforced"]
+    assert resumed["action"] == "continue"
+    assert resumed["reason"] == "recovery-observation-only"
+
+
+def test_logprob_drift_gate_accepts_initial_backend_and_rejects_invalid_step() -> None:
+    passed = logprob_drift_gate({"ratio_p01": 0.9, "ratio_p99": 1.1}, start_step=0)
+    assert passed["passed"] and passed["enforced"] and passed["action"] == "continue"
+    with pytest.raises(ValueError, match="nonnegative"):
+        logprob_drift_gate({"ratio_p01": 1.0, "ratio_p99": 1.0}, start_step=-1)

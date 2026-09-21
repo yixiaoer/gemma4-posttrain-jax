@@ -12,15 +12,15 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "yixiaoer" }]
 dependencies = [
-    "jax>=0.11.1",
-    "numpy>=2.5",
+    "jax>=0.11.0",
+    "numpy>=2.3.5",
     "einops>=0.8",
     "optax>=0.2.8",
     "safetensors>=0.8.0",
 ]
 
 [project.optional-dependencies]
-tpu = ["jax[tpu]>=0.11.1"]
+tpu = ["jax[tpu]>=0.11.0"]
 hf = [
     "torch>=2.14.0",
     "transformers>=5.16.1",

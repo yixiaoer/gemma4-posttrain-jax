@@ -191,7 +191,7 @@ def eval_subset(dataset: Sequence[Any], *, size: int = 500, seed: int = 0) -> li
 
 
 def grpo_prompt_indices(dataset_size: int, prompt_batch_size: int, step: int, *, seed: int = 0) -> list[int]:
-    """由更新步数还原 prompt 顺序；epoch 尾部不足一批时丢弃，恢复无需隐含 cursor。"""
+    """按候选问题批次的位置还原顺序；step 接收 data_cursor，包含补采后未用于训练的批次。"""
 
     if not 0 < prompt_batch_size <= dataset_size or step < 0:
         raise ValueError("need 0 < prompt_batch_size <= dataset_size and step >= 0")

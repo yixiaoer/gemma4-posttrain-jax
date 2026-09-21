@@ -7,8 +7,10 @@ import math
 import os
 import shutil
 import uuid
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
+from contextlib import closing
 from functools import lru_cache
+from itertools import product
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
@@ -23,6 +25,7 @@ FORMAT_NAME = "gemma4_posttrain_jax-train-state"
 # 兼容读取初版文件；保存新文件时使用 FORMAT_NAME。
 LEGACY_FORMAT_NAMES = frozenset({"gemma4-rl-jax-train-state"})
 FORMAT_VERSION = 1
+_CHECKPOINT_CHUNK_BYTES = 64 * 2**20
 
 
 def _flatten_named(tree: Any) -> tuple[list[str], list[Any], Any]:
@@ -54,30 +57,107 @@ def _safetensors_dtype(dtype: np.dtype) -> str:
     return cast(str, json.loads(encoded[8 : 8 + header_size])["array"]["dtype"])
 
 
-def _write_leaf(file: BinaryIO, leaf: Any) -> None:
-    """只保留当前张量的主机视图，不给活跃训练状态积累device_get缓存。"""
+@jax.jit(static_argnums=(2, 3))
+def _checkpoint_slice(value: jax.Array, starts: tuple, sizes: tuple, local_shape: tuple) -> jax.Array:
+    """在单个本地分片上取连续块；浮点数以整数编码返回，避免数值转换。"""
+    result = jax.lax.dynamic_slice(value.reshape(local_shape), starts, sizes)
+    dtype = np.dtype(value.dtype)
+    if dtype.kind == "f" or dtype == jnp.bfloat16:
+        return jax.lax.bitcast_convert_type(result, np.dtype(f"uint{8 * dtype.itemsize}"))
+    return result
 
-    temporary = None
-    try:
-        if isinstance(leaf, jax.Array):
-            if not leaf.is_fully_addressable:
-                raise ValueError("checkpoint requires fully addressable arrays on a single host")
-            # may_alias=False保证独立副本；释放它不会删除原训练状态。
-            # 代价是当前张量的设备副本，避免为整个状态保留主机缓存。
-            temporary = jax.device_put(leaf, leaf.sharding, may_alias=False)
-            leaf = temporary
-        array = np.asarray(jax.device_get(leaf), order="C")
-        if not array.dtype.isnative:
-            array = array.astype(array.dtype.newbyteorder("="))
-        # safetensors要求小端、行优先；uint8视图同时兼容BF16和零维标量。
-        if not np.little_endian:
-            array = array.byteswap()
-        data = memoryview(array.reshape(-1).view(np.uint8))
-        if file.write(data) != len(data):
-            raise OSError("incomplete checkpoint tensor write")
-    finally:
-        if temporary is not None:
-            temporary.delete()
+
+def iter_host_array_blocks(leaf: Any, *, max_bytes: int = _CHECKPOINT_CHUNK_BYTES) -> Generator[np.ndarray, None, None]:
+    """按全局C顺序读回有界数据块；调用方处理后释放当前块，异常时关闭迭代器。"""
+    if not isinstance(leaf, jax.Array):
+        leaf = np.asarray(leaf)
+    dtype = np.dtype(leaf.dtype)
+    shape = tuple(leaf.shape)
+    if not isinstance(max_bytes, int) or max_bytes < dtype.itemsize:
+        raise ValueError("host block limit must fit at least one array element")
+    if isinstance(leaf, jax.Array) and not leaf.is_fully_addressable:
+        raise ValueError("checkpoint requires fully addressable arrays on a single host")
+    if math.prod(shape) * dtype.itemsize <= max_bytes:
+        temporary = None
+        try:
+            if isinstance(leaf, jax.Array):
+                temporary = jax.device_put(leaf, leaf.sharding, may_alias=False)
+            value = np.asarray(jax.device_get(leaf if temporary is None else temporary), order="C")
+            yield value
+            del value
+        finally:
+            if temporary is not None:
+                temporary.delete()
+        return
+    # 前面的维度逐个遍历，当前维度分块，后面的维度保持完整。
+    # 每块对应文件中连续的一段，既支持很宽的矩阵，也支持高维参数。
+    budget = max_bytes // dtype.itemsize
+    axis = 0
+    while math.prod(shape[axis + 1 :]) > budget:
+        axis += 1
+    rows = min(shape[axis], budget // math.prod(shape[axis + 1 :]))
+    shards = []
+    if isinstance(leaf, jax.Array):
+        seen = set()
+        for shard in leaf.addressable_shards:
+            bounds = tuple(
+                (index, index + 1) if isinstance(index, int) else index.indices(size)[:2]
+                for index, size in zip(shard.index, shape, strict=True)
+            )
+            if bounds not in seen:
+                seen.add(bounds)
+                shards.append((bounds, shard.data))
+    for prefix in product(*(range(size) for size in shape[:axis])):
+        for offset in range(0, shape[axis], rows):
+            start = (*prefix, offset, *((0,) * (len(shape) - axis - 1)))
+            block_shape = (*((1,) * axis), min(rows, shape[axis] - offset), *shape[axis + 1 :])
+            if isinstance(leaf, jax.Array):
+                block = np.empty(block_shape, dtype=dtype)
+                covered = 0
+                for bounds, data in shards:
+                    lower = tuple(max(a, origin) for (a, _), origin in zip(bounds, start, strict=True))
+                    upper = tuple(
+                        min(b, origin + size) for (_, b), origin, size in zip(bounds, start, block_shape, strict=True)
+                    )
+                    sizes = tuple(b - a for a, b in zip(lower, upper, strict=True))
+                    if any(size <= 0 for size in sizes):
+                        continue
+                    starts = tuple(a - bound[0] for a, bound in zip(lower, bounds, strict=True))
+                    local_shape = tuple(b - a for a, b in bounds)
+                    temporary = _checkpoint_slice(data, starts, sizes, local_shape)
+                    try:
+                        host = np.asarray(jax.device_get(temporary), order="C")
+                        if host.dtype != dtype:
+                            host = host.view(dtype)
+                        destination = tuple(
+                            slice(a - origin, b - origin) for a, b, origin in zip(lower, upper, start, strict=True)
+                        )
+                        block[destination] = host
+                        covered += math.prod(sizes)
+                        del host
+                    finally:
+                        temporary.delete()
+                if covered != block.size:
+                    raise ValueError("checkpoint shards do not cover the complete array block")
+            else:
+                selection = tuple(slice(a, a + size) for a, size in zip(start, block_shape, strict=True))
+                block = np.asarray(leaf[selection], order="C")
+            yield block
+            del block
+
+
+def _write_leaf(file: BinaryIO, leaf: Any) -> None:
+    """按最多64MiB的逻辑连续块写入，不在主机拼接完整的大参数。"""
+    with closing(iter_host_array_blocks(leaf, max_bytes=_CHECKPOINT_CHUNK_BYTES)) as blocks:
+        for block in blocks:
+            if not block.dtype.isnative:
+                block = block.astype(block.dtype.newbyteorder("="))
+            if not np.little_endian:
+                block = block.byteswap()
+            view = memoryview(block.reshape(-1).view(np.uint8))
+            if file.write(view) != len(view):
+                raise OSError("incomplete checkpoint tensor write")
+            del view, block
 
 
 def _save_arrays(names: list[str], leaves: list[Any], path: Path) -> list[dict[str, Any]]:
@@ -118,8 +198,8 @@ def _save_arrays(names: list[str], leaves: list[Any], path: Path) -> list[dict[s
 def save_train_state(state: Any, path: str | os.PathLike[str], *, metadata: Mapping[str, Any]) -> Path:
     """逐张量保存完整训练状态，最后原子地发布checkpoint目录。
 
-    不覆盖已有目录，保持版本1的文件格式。主机传输缓冲随最大张量增长，
-    每次需要该张量的独立设备副本；tmpfs中的输出文件仍占用主机物理内存。
+    不覆盖已有目录，保持版本1的文件格式。大参数按最多64MiB分块，
+    主机保留当前块及一个分片读回缓冲；tmpfs文件仍占用主机物理内存。
     """
 
     target = Path(path)

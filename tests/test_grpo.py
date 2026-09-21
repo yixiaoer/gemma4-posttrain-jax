@@ -318,7 +318,8 @@ def test_grpo_microbatch_matches_full_gradient_and_adam(grad_tiny, aggregation) 
 
 
 @pytest.mark.tpu
-def test_grpo_microbatch_tpu_matches_full_update(tpu_grad_tiny) -> None:
+@pytest.mark.parametrize("beta,kl_clamp_value", [(0.0, None), (0.04, None), (0.04, 1e-6)])
+def test_grpo_microbatch_tpu_matches_full_update(tpu_grad_tiny, beta, kl_clamp_value) -> None:
     from gemma4_posttrain_jax.sharding import make_mesh, replicate_scalars, shard_batch, shard_gemma4_text_params
 
     assert jax.default_backend() == "tpu" and jax.device_count() == 4
@@ -329,6 +330,12 @@ def test_grpo_microbatch_tpu_matches_full_update(tpu_grad_tiny) -> None:
     advantages = shard_batch(jnp.asarray([1.0, -0.5] * 4), mesh)
     optimizer, trainable = make_optimizer(params, learning_rate=1e-3, freeze_embeddings=True)
     initial = replicate_scalars(init_train_state(params, optimizer), mesh)
+    reference = None
+    if beta:
+        reference_params = jax.tree.map(lambda x: x * 1.01, params)
+        reference = jax.jit(
+            lambda p: trainer_completion_logps(p, *tokens, config=config, vocab_chunk=16, sequence_chunk=8, mesh=mesh)
+        )(reference_params)
 
     def step(state, size):
         return grpo_train_step(
@@ -336,7 +343,7 @@ def test_grpo_microbatch_tpu_matches_full_update(tpu_grad_tiny) -> None:
             *tokens,
             advantages,
             None,
-            None,
+            reference,
             config=config,
             optimizer=optimizer,
             trainable_mask=trainable,
@@ -345,11 +352,17 @@ def test_grpo_microbatch_tpu_matches_full_update(tpu_grad_tiny) -> None:
             sequence_chunk=8,
             mesh=mesh,
             microbatch_size=size,
+            beta=beta,
+            kl_clamp_value=kl_clamp_value,
         )
 
     full, full_metrics = jax.jit(lambda state: step(state, None))(initial)
     split, split_metrics = jax.jit(lambda state: step(state, 4))(initial)
     np.testing.assert_allclose(split_metrics.grad_norm, full_metrics.grad_norm, rtol=2e-5)
+    if beta:
+        assert float(full_metrics.loss_metrics.kl_loss) > 0
+        if kl_clamp_value is not None:
+            assert float(full_metrics.loss_metrics.kl_loss) <= kl_clamp_value * 1.00001
     for actual, expected in zip(jax.tree.leaves(split), jax.tree.leaves(full), strict=True):
         np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-4)
     assert int(split.step) == 1

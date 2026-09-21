@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import hashlib
 import json
 import os
@@ -18,7 +19,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from .inference_runtime import BatchRngState, EngineBatch, EngineConfig, EngineRow, EngineSampling
+from .host_memory import trim_host_allocator
+from .inference_rng import BatchRngState
+from .inference_runtime import EngineBatch, EngineConfig, EngineRow, EngineSampling
 from .inference_wire import (
     PROTOCOL,
     WireError,
@@ -29,6 +32,37 @@ from .inference_wire import (
     send_control,
     validate_descriptor,
 )
+
+WORKER_EXIT_TIMEOUT_S = 30.0
+DEFAULT_WORKER_MODULE = "gemma4_posttrain_jax.inference_process"
+
+
+def validate_worker_module(value: str) -> str:
+    """Accept an importable dotted module name without allowing command arguments."""
+    if not value or any(not part.isidentifier() for part in value.split(".")):
+        raise ValueError("引擎worker模块必须是合法的Python模块名")
+    return value
+
+
+@contextlib.contextmanager
+def parameter_host_view(leaf: Any, jax: Any, np: Any, mode: str) -> Iterator[Any]:
+    """按指定模式取得单个参数的连续FP32主机视图，并及时释放短期设备副本。"""
+    temporary = None
+    try:
+        source = leaf
+        if mode == "transient_copy":
+            if not isinstance(leaf, jax.Array):
+                raise TypeError("transient_copy只接受JAX数组")
+            temporary = jax.device_put(leaf, leaf.sharding, may_alias=False)
+            if temporary is leaf:
+                raise RuntimeError("短期读回副本仍引用原参数数组")
+            source = temporary
+        elif mode != "direct":
+            raise ValueError("未知参数读回模式")
+        yield np.asarray(jax.device_get(source), dtype="<f4", order="C")
+    finally:
+        if temporary is not None:
+            temporary.delete()
 
 
 def isolated_library_environment(parent: Mapping[str, str]) -> dict[str, str]:
@@ -117,7 +151,13 @@ class RemoteEngineRuntime:
         record_path: Path,
         timeout_s: float = 900,
         expected_environment: dict[str, Any] | None = None,
+        worker_module: str = DEFAULT_WORKER_MODULE,
     ) -> None:
+        worker_module = validate_worker_module(worker_module)
+        if config.weight_sync_transport != "host":
+            raise ValueError(
+                "两套独立运行时要求 weight_sync_transport=host；跨进程 ICI 请使用 inference-distributed 共同运行时"
+            )
         if os.environ.get("TPU_VISIBLE_CHIPS") != "0,1":
             raise ValueError("父训练进程必须在JAX初始化前绑定物理chips0,1")
         if tuple(config.device_indexes) != (0, 1) or not python_executable.is_file():
@@ -155,7 +195,7 @@ class RemoteEngineRuntime:
             str(python_executable),
             "-u",
             "-m",
-            "gemma4_posttrain_jax.inference_process",
+            worker_module,
             "--socket",
             str(self._socket_path),
             "--engine-config",
@@ -167,6 +207,7 @@ class RemoteEngineRuntime:
         log_path = record_path.with_suffix(".log")
         self.metadata.update(
             command=command,
+            worker_module=worker_module,
             log_path=str(log_path),
             environment={
                 k: env[k]
@@ -278,6 +319,8 @@ class RemoteEngineRuntime:
             raise WireError("训练与推理模型配置身份不同")
         descriptor, leaves = describe_tree(params)
         _, records = validate_descriptor(descriptor, model_config)
+        source_read_mode = self.config.source_read_mode
+        trim_training_allocator = self.config.trim_training_host_allocator_after_transfer
         times = {"source_get_contiguous_s": 0.0, "host_hash_s": 0.0, "socket_send_and_host_ack_s": 0.0}
         receipts = []
         with self._operation():
@@ -289,34 +332,47 @@ class RemoteEngineRuntime:
                 raise WireError("接收方shape/容量准入不同")
             for leaf, record in zip(leaves, records, strict=True):
                 start = time.perf_counter()
-                host = np.asarray(jax.device_get(leaf), dtype="<f4", order="C")
-                times["source_get_contiguous_s"] += time.perf_counter() - start
-                if list(host.shape) != record["shape"] or host.nbytes != record["bytes"]:
-                    raise WireError("实际源host布局与descriptor不同")
-                raw = memoryview(host).cast("B")
-                start = time.perf_counter()
-                digest = byte_sha(raw)
-                times["host_hash_s"] += time.perf_counter() - start
-                start = time.perf_counter()
-                send_control(
-                    self._connection,
-                    {
-                        "kind": "fp32_leaf",
-                        "index": record["index"],
-                        "path": record["path"],
-                        "bytes": record["bytes"],
-                        "sha256": digest,
-                    },
-                )
-                self._connection.sendall(raw)
-                ack = receive_control(self._connection)
-                if canonical(ack) != canonical({"status": "host_received", "index": record["index"], "sha256": digest}):
-                    raise WireError("完整主机接收ACK缺失或错误")
-                times["socket_send_and_host_ack_s"] += time.perf_counter() - start
-                receipts.append(
-                    {"index": record["index"], "path": record["path"], "bytes": record["bytes"], "sha256": digest}
-                )
-                del host, raw
+                with parameter_host_view(leaf, jax, np, source_read_mode) as host:
+                    times["source_get_contiguous_s"] += time.perf_counter() - start
+                    if list(host.shape) != record["shape"] or host.nbytes != record["bytes"]:
+                        raise WireError("实际源host布局与descriptor不同")
+                    raw = memoryview(host).cast("B")
+                    start = time.perf_counter()
+                    digest = byte_sha(raw)
+                    times["host_hash_s"] += time.perf_counter() - start
+                    start = time.perf_counter()
+                    send_control(
+                        self._connection,
+                        {
+                            "kind": "fp32_leaf",
+                            "index": record["index"],
+                            "path": record["path"],
+                            "bytes": record["bytes"],
+                            "sha256": digest,
+                        },
+                    )
+                    self._connection.sendall(raw)
+                    ack = receive_control(self._connection)
+                    if canonical(ack) != canonical(
+                        {"status": "host_received", "index": record["index"], "sha256": digest}
+                    ):
+                        raise WireError("完整主机接收ACK缺失或错误")
+                    times["socket_send_and_host_ack_s"] += time.perf_counter() - start
+                    receipts.append(
+                        {"index": record["index"], "path": record["path"], "bytes": record["bytes"], "sha256": digest}
+                    )
+                    del raw
+            host_cleanup: dict[str, Any] = {
+                "after_all_host_acks": True,
+                "before_device_commit_response": True,
+                "gc_collected": None,
+                "allocator_trim": {"enabled": False},
+            }
+            if trim_training_allocator:
+                # Python会让循环变量继续引用最后一个主机数组；先释放它再请求glibc回收空闲页。
+                del host
+                host_cleanup["gc_collected"] = gc.collect()
+                host_cleanup["allocator_trim"] = trim_host_allocator()
             # 所有host ACK仍不足以更新策略版本；必须收到实际设备提交响应。
             response = self._response(request_id, "device_committed")
             report: dict[str, Any] = response["report"]
@@ -337,6 +393,8 @@ class RemoteEngineRuntime:
                 "times_s": times,
                 "total_bytes": sum(x["bytes"] for x in receipts),
                 "wall_s": time.perf_counter() - started,
+                "source_read_mode": source_read_mode,
+                "host_cleanup": host_cleanup,
             }
             return report
 
@@ -391,10 +449,14 @@ class RemoteEngineRuntime:
             self._connection.close()
             if process is not None:
                 wait_started = time.monotonic()
-                wait_report: dict[str, Any] = {"timeout_s": 15, "timed_out": False, "started_monotonic": wait_started}
+                wait_report: dict[str, Any] = {
+                    "timeout_s": WORKER_EXIT_TIMEOUT_S,
+                    "timed_out": False,
+                    "started_monotonic": wait_started,
+                }
                 report["worker_wait"] = wait_report
                 try:
-                    process.wait(timeout=15)
+                    process.wait(timeout=WORKER_EXIT_TIMEOUT_S)
                 except subprocess.TimeoutExpired:
                     wait_report["timed_out"] = True
                 finally:

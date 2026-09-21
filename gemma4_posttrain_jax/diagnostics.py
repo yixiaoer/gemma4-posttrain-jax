@@ -3,12 +3,39 @@
 from __future__ import annotations
 
 import importlib.metadata
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import jax
 import numpy as np
+
+
+def checkpoint_storage(path: Path | None, *, mountinfo: str | None = None) -> dict[str, Any] | None:
+    """按实际挂载点识别内存文件系统；非内存文件系统也不代表已有持久备份。"""
+    if path is None:
+        return None
+    resolved = path.resolve()
+    result: dict[str, Any] = {"path": str(resolved), "mount_point": None, "filesystem": None, "memory_backed": None}
+    if mountinfo is None:
+        try:
+            mountinfo = Path("/proc/self/mountinfo").read_text()
+        except OSError:
+            return result
+    longest = -1
+    for line in mountinfo.splitlines():
+        before, separator, after = line.partition(" - ")
+        fields, filesystem = before.split(), after.split()
+        if not separator or len(fields) < 6 or not filesystem:
+            continue
+        mount = Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), fields[4]))
+        if resolved.is_relative_to(mount) and len(mount.parts) > longest:
+            longest = len(mount.parts)
+            result.update(
+                mount_point=str(mount), filesystem=filesystem[0], memory_backed=filesystem[0] in {"tmpfs", "ramfs"}
+            )
+    return result
 
 
 def optional_package_version(name: str) -> str | None:
@@ -106,4 +133,38 @@ def logprob_drift_metrics(
         "ratio_p01": float(np.quantile(ratio, 0.01)),
         "ratio_p50": float(np.quantile(ratio, 0.50)),
         "ratio_p99": float(np.quantile(ratio, 0.99)),
+    }
+
+
+def logprob_drift_gate(
+    metrics: dict[str, float | int | str],
+    *,
+    start_step: int,
+    ratio_lower: float = 0.9,
+    ratio_upper: float = 1.1,
+) -> dict[str, float | int | bool | str]:
+    """Apply the rollout/trainer admission gate only to a run starting at step zero.
+
+    A resumed process observes a different generated batch than the original run's
+    first batch.  Its drift remains useful evidence, but making it a new admission
+    gate would give continuous and resumed execution different control flow.
+    """
+
+    if start_step < 0:
+        raise ValueError("start_step must be nonnegative")
+    ratio_p01 = float(metrics["ratio_p01"])
+    ratio_p99 = float(metrics["ratio_p99"])
+    passed = ratio_p01 >= ratio_lower and ratio_p99 <= ratio_upper
+    enforced = start_step == 0
+    return {
+        "protocol": "startup-logprob-drift-gate-v2",
+        "start_step": start_step,
+        "ratio_lower": ratio_lower,
+        "ratio_upper": ratio_upper,
+        "ratio_p01": ratio_p01,
+        "ratio_p99": ratio_p99,
+        "passed": passed,
+        "enforced": enforced,
+        "action": "continue" if passed or not enforced else "stop-before-update",
+        "reason": "initial-backend-admission" if enforced else "recovery-observation-only",
     }

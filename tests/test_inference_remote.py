@@ -11,14 +11,30 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import numpy as np
 import pytest
 
+import gemma4_posttrain_jax.inference_remote as inference_remote
 from gemma4_posttrain_jax.inference_process import receive_parameters
-from gemma4_posttrain_jax.inference_remote import RemoteEngineRuntime, live_owned_group_members
+from gemma4_posttrain_jax.inference_remote import (
+    DEFAULT_WORKER_MODULE,
+    WORKER_EXIT_TIMEOUT_S,
+    RemoteEngineRuntime,
+    live_owned_group_members,
+    validate_worker_module,
+)
 from gemma4_posttrain_jax.inference_wire import WireError, canonical, receive_control, send_control
+
+
+def test_worker_module_is_a_single_importable_name() -> None:
+    assert validate_worker_module(DEFAULT_WORKER_MODULE) == "gemma4_posttrain_jax.inference_process"
+    assert validate_worker_module("reverse.rollout.q01_hidden_worker") == "reverse.rollout.q01_hidden_worker"
+    for value in ("", "reverse/worker", "reverse.worker --flag", ".worker", "worker."):
+        with pytest.raises(ValueError, match="Python模块名"):
+            validate_worker_module(value)
 
 
 def client_for_socket(connection, config):
@@ -29,6 +45,7 @@ def client_for_socket(connection, config):
     runtime._connection = connection
     runtime._request_id = 0
     runtime.policy_version = 0
+    runtime.config = SimpleNamespace(source_read_mode="direct", trim_training_host_allocator_after_transfer=False)
     runtime.metadata = {"remote": {"model_config_sha256": hashlib.sha256(canonical(config._asdict())).hexdigest()}}
     return runtime
 
@@ -64,7 +81,14 @@ def test_host_receive_cannot_advance_version_without_valid_commit(tiny_a, finish
                 },
             )
         if finish == "commit":
-            assert future.result(timeout=5)["client_transport"]["complete"]
+            client_transport = future.result(timeout=5)["client_transport"]
+            assert client_transport["complete"]
+            assert client_transport["host_cleanup"] == {
+                "after_all_host_acks": True,
+                "before_device_commit_response": True,
+                "gc_collected": None,
+                "allocator_trim": {"enabled": False},
+            }
             assert client.policy_version == 1 and not client._broken
         else:
             with pytest.raises(WireError):
@@ -72,6 +96,55 @@ def test_host_receive_cannot_advance_version_without_valid_commit(tiny_a, finish
             assert client.policy_version is None and client._broken
             with pytest.raises(WireError, match="关闭或此前失败"), client._operation():
                 pytest.fail("失效后端不应进入下一次调用")
+
+
+def test_training_allocator_trim_runs_after_host_receive_and_before_device_response(tiny_a, monkeypatch):
+    _, params, config = tiny_a
+    trim_called = threading.Event()
+    monkeypatch.setattr(inference_remote.gc, "collect", lambda: 17)
+
+    def trim():
+        trim_called.set()
+        return {"enabled": True, "returned": 1, "rss_before_bytes": 20, "rss_after_bytes": 10, "wall_s": 0.1}
+
+    monkeypatch.setattr(inference_remote, "trim_host_allocator", trim)
+    left, right = socket.socketpair()
+    with left, right, ThreadPoolExecutor(max_workers=1) as pool:
+        left.settimeout(5)
+        right.settimeout(5)
+        client = client_for_socket(left, config)
+        client.config = SimpleNamespace(
+            source_read_mode="transient_copy", trim_training_host_allocator_after_transfer=True
+        )
+        future = pool.submit(client.sync_params, params, config, 1)
+        request = receive_control(right)
+        _, transport = receive_parameters(right, request["descriptor"], config)
+        assert trim_called.wait(timeout=5)
+        assert not future.done() and client.policy_version == 0
+        transport["device_commit"] = True
+        send_control(
+            right,
+            {
+                "status": "device_committed",
+                "request_id": request["request_id"],
+                "version": 1,
+                "report": {"complete": True, "version": 1, "host_transport": transport},
+            },
+        )
+        cleanup = future.result(timeout=5)["client_transport"]["host_cleanup"]
+
+    assert cleanup == {
+        "after_all_host_acks": True,
+        "before_device_commit_response": True,
+        "gc_collected": 17,
+        "allocator_trim": {
+            "enabled": True,
+            "returned": 1,
+            "rss_before_bytes": 20,
+            "rss_after_bytes": 10,
+            "wall_s": 0.1,
+        },
+    }
 
 
 def test_reentrant_request_does_not_cancel_active_request(tiny_a):
@@ -147,7 +220,7 @@ def test_cannot_target_training_process_group():
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux进程组边界")
 @pytest.mark.parametrize(("exit_code", "timed_out"), [(0, False), (0, True), (1, True)])
 def test_wait_timeout_is_not_a_signal_and_cannot_qualify_close(monkeypatch, exit_code, timed_out):
-    """重放wait报告超时、组扫描时worker已自行退出的竞态，不延长退出门槛。"""
+    """重放wait报告超时、组扫描时worker已自行退出的竞态。"""
     worker = subprocess.Popen(
         [sys.executable, "-c", f"raise SystemExit({exit_code})"],
         stdin=subprocess.DEVNULL,
@@ -188,7 +261,7 @@ def test_wait_timeout_is_not_a_signal_and_cannot_qualify_close(monkeypatch, exit
         monkeypatch.setattr(runtime, "_request", lambda operation: 0)
         monkeypatch.setattr(runtime, "_response", lambda request_id, status: {"report": {"complete": True}})
         report = runtime.close()
-        assert calls == [15, 5]
+        assert calls == [WORKER_EXIT_TIMEOUT_S, 5]
         assert report["worker_wait"]["timed_out"] is timed_out
         assert report["worker_wait"]["wall_s"] >= 0
         assert report["worker_stopped"] and report["worker_exit_code"] == exit_code

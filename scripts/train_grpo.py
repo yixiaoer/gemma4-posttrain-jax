@@ -42,7 +42,13 @@ from gemma4_posttrain_jax.data import (
     load_gsm8k,
     split_holdout_indices,
 )
-from gemma4_posttrain_jax.diagnostics import logprob_drift_metrics, optional_package_version, source_git_state
+from gemma4_posttrain_jax.diagnostics import (
+    checkpoint_storage,
+    logprob_drift_gate,
+    logprob_drift_metrics,
+    optional_package_version,
+    source_git_state,
+)
 from gemma4_posttrain_jax.evaluation import evaluate_batches, make_eval_sampler, prepare_eval_batches
 from gemma4_posttrain_jax.lora import LoRAConfig, check_lora_config, init_lora_params, prepare_lora_params
 from gemma4_posttrain_jax.lora_training import LoRAPolicyParams, lora_base_identity, make_lora_optimizer
@@ -73,6 +79,33 @@ from gemma4_posttrain_jax.sharding import (
 from gemma4_posttrain_jax.tracking import compile_tracking_metrics, grpo_tracking_metrics, init_tracker
 from gemma4_posttrain_jax.weights import load_hf_eos_token_ids, load_hf_params
 
+TIMING_PROTOCOL = "rl-iteration-stages-v3"
+
+
+def iteration_device_allocation(
+    backend: str, training_ids: list[int], inference_ids: list[int] | None
+) -> dict[str, int]:
+    """完整迭代按实际占用计费；独立运行时的相同编号不表示同一颗芯片。"""
+    if not training_ids or len(set(training_ids)) != len(training_ids):
+        raise ValueError("训练设备必须非空且不重复")
+    if backend == "jax":
+        if inference_ids:
+            raise ValueError("原生同步采样复用训练设备，不分配独立推理设备")
+        separate = 0
+    elif backend in ("inference", "inference-process", "inference-distributed"):
+        if not inference_ids or len(set(inference_ids)) != len(inference_ids):
+            raise ValueError("独立推理设备必须非空且不重复")
+        if backend != "inference-process" and set(training_ids) & set(inference_ids):
+            raise ValueError("同一运行时的训练和推理设备不能重叠")
+        separate = len(inference_ids)
+    else:
+        raise ValueError(f"未知 rollout backend: {backend}")
+    return {
+        "training_devices": len(training_ids),
+        "separate_inference_devices": separate,
+        "allocated_devices": len(training_ids) + separate,
+    }
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -83,13 +116,42 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, required=True, help="新的运行目录，不覆盖历史产物")
     parser.add_argument("--rollout-layout", choices=("replicated", "fsdp"), default="replicated")
-    parser.add_argument("--rollout-backend", choices=("jax", "inference", "inference-process"), default="jax")
+    parser.add_argument(
+        "--rollout-backend", choices=("jax", "inference", "inference-process", "inference-distributed"), default="jax"
+    )
     parser.add_argument("--training-device-ids", type=int, nargs="+", help="显式训练mesh设备ID；省略保持全部设备")
     parser.add_argument(
-        "--inference-device-ids", type=int, nargs="+", help="引擎本地设备：同进程默认2、3；独立进程固定0、1"
+        "--inference-device-ids",
+        type=int,
+        nargs="+",
+        help="同进程默认2、3；独立运行时固定本地0、1；共同运行时按推理进程自动选择全局ID",
     )
     parser.add_argument("--inference-python", type=Path, help="独立进程使用的固定推理环境解释器")
+    parser.add_argument(
+        "--inference-weight-transport",
+        choices=("auto", "host", "device"),
+        default="auto",
+        help="auto 默认：inference/inference-distributed 使用 ICI；独立运行时 inference-process 使用 host",
+    )
     parser.add_argument("--inference-memory-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--inference-source-read-mode",
+        choices=("direct", "transient_copy"),
+        default="direct",
+        help="独立推理进程权重同步时读取训练参数的主机副本策略",
+    )
+    parser.add_argument(
+        "--trim-training-host-allocator-after-transfer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="独立推理进程收到全部参数后，请求训练进程归还空闲主机页",
+    )
+    parser.add_argument(
+        "--trim-inference-host-allocator-after-update",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="独立推理进程完成参数更新后，请求推理进程归还空闲主机页",
+    )
     parser.add_argument("--lora-rank", type=int, help="只训练独立FP32 attention适配器；首个入口需要FSDP/β0/lag0")
     parser.add_argument("--lora-alpha", type=float, help="默认2*rank，训练和保存使用未缩放A/B")
     parser.add_argument("--lora-targets", nargs="+", choices=("q_proj", "k_proj", "v_proj", "o_proj"))
@@ -133,6 +195,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--beta", type=float, default=0.0)
     parser.add_argument(
+        "--kl-clamp-value",
+        type=float,
+        help="可选的逐 token KL 上限；启用后会改变目标和超过上限时的梯度",
+    )
+    parser.add_argument(
         "--truncated-reward",
         choices=("keep", "zero"),
         default="keep",
@@ -171,7 +238,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", default="gemma4_posttrain_jax")
     parser.add_argument("--wandb-run-name")
     parser.add_argument("--wandb-tags", nargs="*", default=())
-    return parser.parse_args()
+    from gemma4_posttrain_jax.inference_runtime import resolve_weight_sync_transport
+
+    args = parser.parse_args()
+    args.inference_weight_transport = resolve_weight_sync_transport(
+        args.rollout_backend, args.inference_weight_transport
+    )
+    return args
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -233,10 +306,43 @@ def compile_call(name: str, fn: Any, arguments: tuple[Any, ...], output_dir: Pat
     return compiled
 
 
+def validate_resume_config(saved: Any, current: dict[str, Any]) -> None:
+    """检查续训配置，仅补齐旧版中不改变训练行为的默认记录字段。"""
+    if not isinstance(saved, dict):
+        raise ValueError("checkpoint 缺少有效的训练配置")
+    restored = dict(saved)
+    if "kl_estimator" not in restored:
+        if restored.get("beta") != 0:
+            raise ValueError(
+                "旧 checkpoint 使用未标注版本的 KL 公式，不能按新 K3 实现精确续训；"
+                "请使用保存该 checkpoint 的代码继续原实验"
+            )
+        restored["kl_estimator"] = "none"
+    restored.setdefault("kl_clamp_value", None)
+    if restored != current:
+        missing = object()
+        changed = sorted(
+            name
+            for name in restored.keys() | current.keys()
+            if restored.get(name, missing) != current.get(name, missing)
+        )
+        raise ValueError(f"恢复配置与 checkpoint 不一致：{', '.join(changed)}")
+
+
 def main() -> None:
     args = parse_args()
     process_inference = args.rollout_backend == "inference-process"
+    distributed_inference = args.rollout_backend == "inference-distributed"
     inference_identity = None
+    memory_controls_enabled = (
+        args.inference_source_read_mode != "direct"
+        or args.trim_training_host_allocator_after_transfer
+        or args.trim_inference_host_allocator_after_update
+    )
+    if memory_controls_enabled and not process_inference:
+        raise ValueError("权重同步主机内存控制只用于独立推理进程后端")
+    if args.trim_training_host_allocator_after_transfer and args.inference_source_read_mode != "transient_copy":
+        raise ValueError("训练侧分配器回收只允许与transient_copy一起启用")
     if args.rollout_backend != "jax":
         if args.lora_rank is not None or args.rollout_lag_updates or args.eval_every:
             raise ValueError("首个引擎闭环不支持LoRA、滞后或进程内周期评估；独立评估可读完整训练状态")
@@ -244,6 +350,20 @@ def main() -> None:
             raise ValueError("引擎闭环需要显式sampler-is-cap，记录trainer/behavior分布修正")
         if not 0 < args.inference_memory_fraction < 1:
             raise ValueError("推理内存比例必须在0和1之间")
+        if distributed_inference:
+            from gemma4_posttrain_jax.inference_shared import shared_devices
+
+            ordered_devices = shared_devices(0)
+            if not os.environ.get("GEMMA4_SHARED_ICI_SOCKET") or not os.environ.get("GEMMA4_SHARED_ICI_NONCE"):
+                raise ValueError("共同运行时需要启动器创建的本机控制连接")
+            if args.training_device_ids is None:
+                args.training_device_ids = [int(d.id) for d in ordered_devices[:2]]
+            if args.inference_device_ids is None:
+                args.inference_device_ids = [int(d.id) for d in ordered_devices[2:]]
+            if args.training_device_ids != [int(d.id) for d in ordered_devices[:2]] or args.inference_device_ids != [
+                int(d.id) for d in ordered_devices[2:]
+            ]:
+                raise ValueError("共同运行时固定 rank0 训练、rank1 推理，各持有两芯")
         if args.training_device_ids is None:
             args.training_device_ids = [0, 1]
         if args.inference_device_ids is None:
@@ -264,6 +384,7 @@ def main() -> None:
         args.inference_device_ids is not None
         or args.inference_memory_fraction != 0.5
         or args.inference_python is not None
+        or memory_controls_enabled
     ):
         raise ValueError("推理设备和内存参数仅用于inference后端")
     lora_config = None
@@ -298,6 +419,13 @@ def main() -> None:
             raise ValueError("save-at-steps必须为预算内完整rollout的正更新步")
     if args.sampler_is_cap is not None and (not np.isfinite(args.sampler_is_cap) or args.sampler_is_cap <= 0):
         raise ValueError("sampler-is-cap必须为正的有限数")
+    if args.kl_clamp_value is not None and (
+        not np.isfinite(args.kl_clamp_value)
+        or args.kl_clamp_value <= 0
+        or args.kl_clamp_value > float(np.finfo(np.float32).max)
+        or not args.beta
+    ):
+        raise ValueError("kl-clamp-value必须是FP32可表示的正有限数，并且只能在beta大于零时启用")
     if args.dynamic_sampling is None:
         args.dynamic_sampling = args.algorithm == "dapo"
     if args.filter_truncated_loss is None:
@@ -378,7 +506,7 @@ def main() -> None:
     training_ids = list(devices_by_id) if args.training_device_ids is None else args.training_device_ids
     if not training_ids or len(set(training_ids)) != len(training_ids) or set(training_ids) - devices_by_id.keys():
         raise ValueError("训练设备ID必须非空、不重复且实际存在")
-    if args.rollout_backend == "inference":
+    if args.rollout_backend in ("inference", "inference-distributed"):
         inference_ids = args.inference_device_ids
         if (
             not inference_ids
@@ -390,6 +518,7 @@ def main() -> None:
     elif process_inference and sorted(devices_by_id) != [0, 1]:
         raise ValueError("独立进程训练必须实际只看到两个本地TPU设备")
     mesh = make_mesh([devices_by_id[index] for index in training_ids])
+    device_allocation = iteration_device_allocation(args.rollout_backend, training_ids, args.inference_device_ids)
     rows = args.prompt_batch_size * args.group_size
     if rows % mesh.size:
         raise ValueError(f"生成行数 {rows} 必须能被设备数 {mesh.size} 整除")
@@ -446,6 +575,8 @@ def main() -> None:
         "max_new_tokens": args.max_new_tokens,
         "learning_rate": args.learning_rate,
         "beta": args.beta,
+        "kl_estimator": "k3-stable-series-v2" if args.beta else "none",
+        "kl_clamp_value": args.kl_clamp_value,
         "format_bonus": args.format_bonus,
         "success_reward": 1.0,
         "failure_reward": -1.0 if args.algorithm == "dapo" else 0.0,
@@ -472,13 +603,18 @@ def main() -> None:
     if args.rollout_backend != "jax":
         run_config.update(
             {
-                "rollout_backend": "tpu-inference-separate-process-v1"
+                "rollout_backend": "tpu-inference-shared-runtime-v1"
+                if distributed_inference
+                else "tpu-inference-separate-process-v1"
                 if process_inference
                 else "tpu-inference-same-process-v1",
                 "inference_device_ids": args.inference_device_ids,
                 "inference_precision": "default",
                 "inference_kernel_route": "batched",
                 "inference_memory_fraction": args.inference_memory_fraction,
+                "inference_source_read_mode": args.inference_source_read_mode,
+                "trim_training_host_allocator_after_transfer": (args.trim_training_host_allocator_after_transfer),
+                "trim_inference_host_allocator_after_update": (args.trim_inference_host_allocator_after_update),
                 "sampling_rng_protocol": "engine-batch-rng-v1-threefry2x32-fold-in-seed-data-cursor",
                 "inference_weight_protocol": "full-gemma4-params-state-leaves-kv-version-v1",
                 "inference_proposal": "full-policy-temperature-one",
@@ -530,6 +666,27 @@ def main() -> None:
             run_config["training_physical_chips"] = [0, 1]
             run_config["inference_physical_chips"] = [2, 3]
     # 默认chat保持原v4配置；plain的模板协议参与完整checkpoint身份校验。
+    if distributed_inference:
+        run_config["inference_weight_transport"] = "gemma4-shared-runtime-ici-verified-v1"
+        run_config["inference_runtime_versions"] = {
+            name: importlib.metadata.version(name) for name in ("jax", "jaxlib", "libtpu")
+        }
+        for name in (
+            "distributed_ici.py",
+            "inference_shared.py",
+            "inference_local_cpu.py",
+            "inference_wire.py",
+            "inference_remote.py",
+        ):
+            run_config["inference_contract_sha256"][name] = hashlib.sha256(
+                (Path(__file__).resolve().parents[1] / "gemma4_posttrain_jax" / name).read_bytes()
+            ).hexdigest()
+    elif args.inference_weight_transport != "host":
+        run_config["inference_weight_transport"] = "ici-collective-all-replicas-bitwise-v2"
+        for name in ("inference_device.py", "ici_transfer.py"):
+            run_config["inference_contract_sha256"][name] = hashlib.sha256(
+                (Path(__file__).resolve().parents[1] / "gemma4_posttrain_jax" / name).read_bytes()
+            ).hexdigest()
     if args.rollout_layout != "replicated":
         run_config["rollout_layout"] = args.rollout_layout
     if args.prompt_style == "plain":
@@ -557,8 +714,8 @@ def main() -> None:
             }
         )
     resume = None if args.resume is None else read_checkpoint_metadata(args.resume)["metadata"]
-    if resume is not None and resume.get("run_config") != run_config:
-        raise ValueError("恢复配置与 checkpoint 不一致（模型、数据、采样、优化器、精度、shape 或版本改变）")
+    if resume is not None:
+        validate_resume_config(resume.get("run_config"), run_config)
     source_root = Path(__file__).resolve().parents[1]
     revision, diff = source_git_state(source_root)
     (args.output_dir / "source.diff").write_text(diff or "")
@@ -567,6 +724,8 @@ def main() -> None:
         args.output_dir / "meta.json",
         {
             "run_config": run_config,
+            "timing_protocol": TIMING_PROTOCOL,
+            "device_allocation": device_allocation,
             "git_commit": revision,
             "source_diff_sha256": None if diff is None else hashlib.sha256(diff.encode()).hexdigest(),
             "source_files_sha256": {
@@ -752,6 +911,7 @@ def main() -> None:
             remat_layers=args.remat,
             mesh=mesh,
             beta=args.beta,
+            kl_clamp_value=args.kl_clamp_value,
             microbatch_size=args.microbatch_size,
             loss_mask=loss_mask,
             use_current_policy_as_old=capture,
@@ -811,19 +971,44 @@ def main() -> None:
         overlong_penalty=args.overlong_penalty,
     )
     records: list[dict[str, Any]] = []
+    iteration_timing_records: list[dict[str, Any]] = []
     base_key = jax.random.PRNGKey(args.seed)
+    training_finished = False
+    training_session_start = time.perf_counter()
+    tracker_init_s = initial_eval_s = cleanup_s = 0.0
     with (
         ExitStack() as stack,
         ProcessPoolExecutor(max_workers=args.reward_workers, mp_context=multiprocessing.get_context("spawn")) as pool,
         (args.output_dir / "metrics.csv").open("w", newline="") as csv_file,
         (args.output_dir / "rollouts.jsonl").open("w") as samples_file,
+        (args.output_dir / "iteration_timing.jsonl").open("w") as iteration_timing_file,
     ):
+
+        def record_final_state(_exc_type: Any, primary: BaseException | None, _traceback: Any) -> None:
+            if not training_finished or not args.audit_final_state:
+                return
+            from gemma4_posttrain_jax.state_audit import summarize_train_state
+
+            try:
+                final_audit = summarize_train_state(state)
+                write_json(args.output_dir / "final_state_audit.json", final_audit)
+                if not final_audit["all_finite"]:
+                    raise RuntimeError("最终训练状态包含非有限值；检查结果已保存")
+            except BaseException as error:
+                if primary is None:
+                    raise
+                primary.add_note(f"最终训练状态检查也失败：{type(error).__name__}: {error}")
+
+        # 最先登记，最后执行：先关闭引擎，避免完整读回与推理工作区同时占用内存。
+        # ExitStack 在其他关闭操作抛错后仍会执行此检查，同时保留原始异常。
+        stack.push(record_final_state)
         inference_rollout = None
         inference_samples = None
         if args.rollout_backend != "jax":
             from gemma4_posttrain_jax.inference_remote import RemoteEngineRuntime
             from gemma4_posttrain_jax.inference_rollout import InferenceRollout
             from gemma4_posttrain_jax.inference_runtime import EngineConfig, EngineRuntime
+            from gemma4_posttrain_jax.inference_shared import SharedEngineRuntime
 
             assert args.inference_device_ids is not None
             inference_dp = len(args.inference_device_ids)
@@ -837,9 +1022,15 @@ def main() -> None:
                 max_model_len=args.max_prompt_len + args.max_new_tokens,
                 memory_fraction=args.inference_memory_fraction,
                 max_logprobs=128,
+                weight_sync_transport=args.inference_weight_transport,
+                source_read_mode=args.inference_source_read_mode,
+                trim_training_host_allocator_after_transfer=(args.trim_training_host_allocator_after_transfer),
+                trim_host_allocator_after_update=args.trim_inference_host_allocator_after_update,
             )
             runtime: EngineRuntime | RemoteEngineRuntime
-            if process_inference:
+            if distributed_inference:
+                runtime = SharedEngineRuntime(engine_config, path=Path(os.environ["GEMMA4_SHARED_ICI_SOCKET"]))
+            elif process_inference:
                 assert args.inference_python is not None and inference_identity is not None
                 runtime = RemoteEngineRuntime(
                     engine_config,
@@ -872,6 +1063,7 @@ def main() -> None:
             )
             inference_rollout = InferenceRollout(runtime, config, sampler_config=sampler_config, mesh=mesh)
             inference_samples = stack.enter_context((args.output_dir / "inference.jsonl").open("w"))
+        tracker_init_start = time.perf_counter()
         tracker = init_tracker(
             enabled=args.wandb,
             project=args.wandb_project,
@@ -879,6 +1071,7 @@ def main() -> None:
             tags=args.wandb_tags,
             config={"logging_mode": "live", "source_metadata": json.loads((args.output_dir / "meta.json").read_text())},
         )
+        tracker_init_s = time.perf_counter() - tracker_init_start
         stack.callback(tracker.finish)
         writer = None
 
@@ -946,12 +1139,14 @@ def main() -> None:
             selected_golds: list[Gold] = []
             indices: list[int] = []
             accepted_groups = attempts = generated_tokens = 0
-            rollout_s = reward_s = rollout_audit_s = 0.0
+            prompt_prepare_s = rollout_s = rollout_device_get_s = 0.0
+            text_decode_s = reward_s = rollout_record_s = rollout_audit_s = 0.0
             while accepted_groups < args.prompt_batch_size:
                 if attempts == args.max_sampling_attempts:
                     raise RuntimeError(
                         f"补采{attempts}批后仅保留{accepted_groups}/{args.prompt_batch_size}个有效组；未更新参数，生成证据已保存"
                     )
+                prompt_prepare_start = time.perf_counter()
                 positions = grpo_prompt_indices(
                     len(training_indices), args.prompt_batch_size, data_cursor, seed=args.seed
                 )
@@ -968,6 +1163,7 @@ def main() -> None:
                 key = jax.random.fold_in(base_key, data_cursor)
                 data_cursor += 1
                 attempts += 1
+                prompt_prepare_s += time.perf_counter() - prompt_prepare_start
                 if inference_rollout is not None:
                     rollout, elapsed = timed_call(partial(inference_rollout.generate, key=key), ids, mask)
                     if inference_rollout.last_proposal_logps is None:
@@ -989,9 +1185,11 @@ def main() -> None:
                         )
                     rollout, elapsed = timed_call(generate_executable, rollout_params, ids, mask, key)
                 rollout_s += elapsed
+                transfer_start = time.perf_counter()
                 completion_ids, completion_mask, lengths, behavior_logps = jax.device_get(
                     (rollout.completion_ids, rollout.completion_mask, rollout.lengths, rollout.rollout_logps)
                 )
+                rollout_device_get_s += time.perf_counter() - transfer_start
                 if args.audit_rollout_batches:
                     audit_start = time.perf_counter()
                     audit_dir = args.output_dir / "rollout_batches"
@@ -1028,16 +1226,19 @@ def main() -> None:
                             eos_ids=np.asarray(sampler_config.eos_ids, np.int32),
                         )
                     rollout_audit_s += time.perf_counter() - audit_start
+                decode_start = time.perf_counter()
                 generated_tokens += int(lengths.sum())
                 completions = tokenizer.batch_decode(
                     [tokens[:length] for tokens, length in zip(completion_ids, lengths, strict=True)],
                     skip_special_tokens=True,
                 )
+                text_decode_s += time.perf_counter() - decode_start
                 reward_start = time.perf_counter()
                 reward = score_completions(
                     completions, prompts.golds, completion_lengths=lengths, config=reward_config, executor=pool
                 )
                 reward_s += time.perf_counter() - reward_start
+                record_start = time.perf_counter()
                 truncated = (lengths == args.max_new_tokens) & ~np.isin(completion_ids[:, -1], sampler_config.eos_ids)
                 training_rewards = reward.score.copy()
                 if args.truncated_reward == "zero":
@@ -1096,7 +1297,9 @@ def main() -> None:
                     selected_golds.extend(prompts.golds[index] for index in kept_rows)
                     indices.extend(candidate_indices[index] for index in keep)
                     accepted_groups += len(keep)
+                rollout_record_s += time.perf_counter() - record_start
             del rollout_params
+            batch_prepare_start = time.perf_counter()
             combined = {name: np.concatenate(values) for name, values in pieces.items()}
             prompts = PromptBatch(combined["ids"], combined["mask"], tuple(selected_questions), tuple(selected_golds))
             ids, mask = shard_batch((prompts.prompt_ids, prompts.prompt_mask), mesh)
@@ -1121,7 +1324,8 @@ def main() -> None:
                     raise RuntimeError("整批loss mask为空，保留生成记录并停止，不执行无信号的Adam更新")
             token_arguments = (ids, mask, rollout.completion_ids, rollout.completion_mask)
             reference_logps = None
-            reference_s = startup_logps_s = 0.0
+            batch_prepare_s = time.perf_counter() - batch_prepare_start
+            reference_transfer_s = reference_logps_s = startup_logps_s = 0.0
             if reference_host is not None:
                 # 参考模型与 rollout 复制工作区不能同时常驻 v4 HBM；只在本阶段放入 FSDP 分片。
                 reference, reference_transfer_s = timed_call(
@@ -1131,9 +1335,9 @@ def main() -> None:
                     reference_executable = compile_call(
                         "reference", logps_fn, (reference, *token_arguments), args.output_dir, args.save_hlo
                     )
-                reference_logps, reference_s = timed_call(reference_executable, reference, *token_arguments)
-                reference_s += reference_transfer_s
+                reference_logps, reference_logps_s = timed_call(reference_executable, reference, *token_arguments)
                 del reference
+            reference_s = reference_transfer_s + reference_logps_s
             # 独立前向仅作为首批sampler诊断；μ轮old从实际联合梯度前向捕获。
             old_logps_s = 0.0
             is_weights = None
@@ -1176,6 +1380,9 @@ def main() -> None:
                 )
                 write_json(args.output_dir / "startup_drift.json", drift)
                 print(json.dumps({"startup_drift": drift}), flush=True)
+                drift_gate = logprob_drift_gate(drift, start_step=start_step)
+                write_json(args.output_dir / "startup_drift_gate.json", drift_gate)
+                print(json.dumps({"startup_drift_gate": drift_gate}), flush=True)
                 parity_arrays = {
                     "behavior_policy_step": np.asarray(behavior_step),
                     "target_old_policy_step": np.asarray(step),
@@ -1201,7 +1408,7 @@ def main() -> None:
                 }
                 filename = "startup_parity_batch.npz" if needs_old_logps else "parity_batch.npz"
                 np.savez(args.output_dir / filename, allow_pickle=False, **parity_arrays)
-                if not (float(drift["ratio_p01"]) >= 0.9 and float(drift["ratio_p99"]) <= 1.1):
+                if drift_gate["action"] == "stop-before-update":
                     raise RuntimeError("启动独立前向H2 drift gate 未通过；已保存固定输入，尚未更新参数")
                 if not np.isfinite(np.asarray(trainer_logps)[completion_mask]).all():
                     raise RuntimeError("trainer logprob 含非有限值")
@@ -1298,6 +1505,23 @@ def main() -> None:
                         print(json.dumps({"joint_old_drift": joint_drift}), flush=True)
                 values = {name: float(value) for name, value in metrics.loss_metrics._asdict().items()}
                 values["grad_norm"] = float(metrics.grad_norm)
+                if args.audit_update_state and needs_old_logps:
+                    audit_start = time.perf_counter()
+                    np.savez(
+                        args.output_dir / f"update_probabilities_{step + 1:08d}.npz",
+                        policy_logps=np.asarray(metrics.policy_logps),
+                        old_logps=np.asarray(old_for_update),
+                        reference_logps=np.empty((0,), np.float32)
+                        if reference_logps is None
+                        else np.asarray(reference_logps),
+                        behavior_logps=np.asarray(rollout.rollout_logps),
+                        completion_mask=completion_mask,
+                        loss_mask=completion_mask if loss_mask is None else np.asarray(loss_mask),
+                        advantages=np.asarray(advantages),
+                        sampler_is_weights=np.empty((0,), np.float32) if is_weights is None else np.asarray(is_weights),
+                        use_current_policy_as_old=np.asarray(iteration == 0),
+                    )
+                    update_audit_s += time.perf_counter() - audit_start
                 if not all(np.isfinite(value) for value in values.values()):
                     raise RuntimeError(f"step {step + 1} loss/gradient/metrics 含非有限值：{values}")
                 if (args.updates_per_rollout == 1 or iteration == 0) and (values["ratio_min"], values["ratio_max"]) != (
@@ -1345,10 +1569,18 @@ def main() -> None:
                     ),
                     "nonzero_advantage_fraction": float(np.mean(np.asarray(advantages) != 0)),
                     "reshard_s": reshard_s if iteration == 0 else 0.0,
+                    "prompt_prepare_s": prompt_prepare_s if iteration == 0 else 0.0,
                     "rollout_s": rollout_s if iteration == 0 else 0.0,
+                    "rollout_device_get_s": rollout_device_get_s if iteration == 0 else 0.0,
+                    "rollout_audit_s": rollout_audit_s if iteration == 0 else 0.0,
+                    "text_decode_s": text_decode_s if iteration == 0 else 0.0,
                     "reward_s": reward_s if iteration == 0 else 0.0,
+                    "rollout_record_s": rollout_record_s if iteration == 0 else 0.0,
+                    "batch_prepare_s": batch_prepare_s if iteration == 0 else 0.0,
                     "startup_logps_s": startup_logps_s if iteration == 0 else 0.0,
                     "reference_s": reference_s if iteration == 0 else 0.0,
+                    "reference_transfer_s": reference_transfer_s if iteration == 0 else 0.0,
+                    "reference_logps_s": reference_logps_s if iteration == 0 else 0.0,
                     "update_s": update_s,
                     "update_audit_s": update_audit_s,
                     "old_logps_s": old_logps_s if iteration == 0 else 0.0,
@@ -1367,9 +1599,9 @@ def main() -> None:
                     "step_s": time.perf_counter() - iteration_start,
                     "checkpoint_s": 0.0,
                     "eval_s": 0.0,
+                    "iteration_before_metrics_log_s": 0.0,
+                    "unattributed_s": 0.0,
                 }
-                if args.audit_rollout_batches:
-                    row["rollout_audit_s"] = rollout_audit_s if iteration == 0 else 0.0
                 if lora_config is not None:
                     # 原6*2.3B估计只适用于旧E2B全参数图，不用于冻结base的LoRA性能声明。
                     row.pop("update_mfu_estimate")
@@ -1390,24 +1622,101 @@ def main() -> None:
                 eval_summary = None
                 if eval_batches and (step + 1) % args.eval_every == 0:
                     row["eval_s"], eval_summary = run_eval(step + 1)
+                row["iteration_before_metrics_log_s"] = time.perf_counter() - iteration_start
+                metrics_prepare_start = time.perf_counter()
+                accounted_fields = (
+                    "reshard_s",
+                    "prompt_prepare_s",
+                    "rollout_s",
+                    "rollout_device_get_s",
+                    "rollout_audit_s",
+                    "text_decode_s",
+                    "reward_s",
+                    "rollout_record_s",
+                    "batch_prepare_s",
+                    "startup_logps_s",
+                    "reference_transfer_s",
+                    "reference_logps_s",
+                    "behavior_snapshot_s",
+                    "update_s",
+                    "update_audit_s",
+                    "checkpoint_s",
+                    "eval_s",
+                )
+                row["unattributed_s"] = row["iteration_before_metrics_log_s"] - sum(
+                    float(row.get(field, 0.0)) for field in accounted_fields
+                )
+                metrics_prepare_s = time.perf_counter() - metrics_prepare_start
+                metrics_csv_start = time.perf_counter()
                 if writer is None:
                     writer = csv.DictWriter(csv_file, fieldnames=list(row))
                     writer.writeheader()
                 writer.writerow(row)
                 csv_file.flush()
+                metrics_csv_s = time.perf_counter() - metrics_csv_start
                 records.append(row)
+                metrics_stdout_start = time.perf_counter()
                 print(json.dumps(row, allow_nan=False), flush=True)
+                metrics_stdout_s = time.perf_counter() - metrics_stdout_start
+                tracker_prepare_start = time.perf_counter()
                 tracked = grpo_tracking_metrics(row, eval_summary)
                 if step == start_step:
                     tracked.update(compile_tracking_metrics(args.output_dir))
+                tracker_prepare_s = time.perf_counter() - tracker_prepare_start
+                tracker_log_start = time.perf_counter()
                 tracker.log(tracked, step=step + 1)
-    if args.audit_final_state:
-        from gemma4_posttrain_jax.state_audit import summarize_train_state
-
-        final_audit = summarize_train_state(state)
-        write_json(args.output_dir / "final_state_audit.json", final_audit)
-        if not final_audit["all_finite"]:
-            raise RuntimeError("最终训练状态包含非有限值；检查结果已保存")
+                tracker_log_s = time.perf_counter() - tracker_log_start
+                iteration_after_metrics_log_s = time.perf_counter() - iteration_start
+                measured_logging_s = (
+                    metrics_prepare_s + metrics_csv_s + metrics_stdout_s + tracker_prepare_s + tracker_log_s
+                )
+                metrics_logging_overhead_s = max(
+                    0.0,
+                    iteration_after_metrics_log_s - row["iteration_before_metrics_log_s"] - measured_logging_s,
+                )
+                metrics_logging_s = measured_logging_s + metrics_logging_overhead_s
+                known_device_idle_s = (
+                    float(row["text_decode_s"])
+                    + float(row["reward_s"])
+                    + float(row["rollout_record_s"])
+                    + metrics_logging_s
+                )
+                timing_record = {
+                    "step": step + 1,
+                    "first_call": int(step == start_step),
+                    **device_allocation,
+                    "iteration_before_metrics_log_s": row["iteration_before_metrics_log_s"],
+                    "metrics_prepare_s": metrics_prepare_s,
+                    "metrics_csv_s": metrics_csv_s,
+                    "metrics_stdout_s": metrics_stdout_s,
+                    "tracker_prepare_s": tracker_prepare_s,
+                    "tracker_log_s": tracker_log_s,
+                    "metrics_logging_overhead_s": metrics_logging_overhead_s,
+                    "metrics_logging_s": metrics_logging_s,
+                    "iteration_after_metrics_log_s": iteration_after_metrics_log_s,
+                    "known_device_idle_s": known_device_idle_s,
+                    "allocated_device_seconds": iteration_after_metrics_log_s * device_allocation["allocated_devices"],
+                    "known_idle_device_seconds": known_device_idle_s * device_allocation["allocated_devices"],
+                }
+                iteration_timing_file.write(json.dumps(timing_record, allow_nan=False) + "\n")
+                iteration_timing_file.flush()
+                iteration_timing_records.append(timing_record)
+        training_finished = True
+        write_json(
+            args.output_dir / "training_end.json",
+            {
+                "event": "training_finished",
+                "cleanup_included": False,
+                "start_step": start_step,
+                "final_step": int(state.step),
+                "final_data_cursor": data_cursor,
+                "generated_rows": sum(row["generated_rows"] for row in records),
+                "generated_tokens": sum(row["generated_tokens"] for row in records),
+            },
+        )
+        cleanup_start = time.perf_counter()
+    cleanup_s = time.perf_counter() - cleanup_start
+    storage = checkpoint_storage(args.checkpoint_dir)
     write_json(
         args.output_dir / "summary.json",
         {
@@ -1417,15 +1726,51 @@ def main() -> None:
             "generated_rows": sum(row["generated_rows"] for row in records),
             "generated_tokens": sum(row["generated_tokens"] for row in records),
             "peak_bytes": device_peak_bytes(),
+            "timing_protocol": TIMING_PROTOCOL,
+            "device_allocation": device_allocation,
+            "training_session_s": time.perf_counter() - training_session_start,
+            "tracker_init_s": tracker_init_s,
+            "initial_eval_s": initial_eval_s,
+            "cleanup_s": cleanup_s,
+            "iteration_timing_record_write_excluded": True,
             "steady_steps": len(records[1:]),
             "steady_mean": {
                 field: float(np.mean([row[field] for row in records[1:]]))
-                for field in ("reshard_s", "rollout_s", "reward_s", "old_logps_s", "reference_s", "update_s", "step_s")
+                for field in (
+                    "reshard_s",
+                    "prompt_prepare_s",
+                    "rollout_s",
+                    "rollout_device_get_s",
+                    "text_decode_s",
+                    "reward_s",
+                    "rollout_record_s",
+                    "batch_prepare_s",
+                    "old_logps_s",
+                    "startup_logps_s",
+                    "reference_transfer_s",
+                    "reference_logps_s",
+                    "reference_s",
+                    "update_s",
+                    "step_s",
+                    "checkpoint_s",
+                    "eval_s",
+                    "iteration_before_metrics_log_s",
+                    "unattributed_s",
+                )
             }
             if len(records) > 1
             else {},
-            "checkpoint_persistent": args.checkpoint_dir is not None
-            and not str(args.checkpoint_dir).startswith("/dev/shm/"),
+            "steady_iteration_after_metrics_log_s": float(
+                np.mean([row["iteration_after_metrics_log_s"] for row in iteration_timing_records[1:]])
+            )
+            if len(iteration_timing_records) > 1
+            else None,
+            "checkpoint_storage": storage,
+            "checkpoint_persistent": False
+            if storage is None
+            else None
+            if storage["memory_backed"] is None
+            else not storage["memory_backed"],
         },
     )
 

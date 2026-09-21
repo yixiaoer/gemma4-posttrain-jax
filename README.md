@@ -36,20 +36,20 @@ SFT 示例用一道内置问答检查训练流程：每一步根据 loss 计算�
 | E2B 文本模型、SFT、原生 GRPO | 已在 TPU v4 上运行，包含生成、训练、保存、恢复和独立评估 |
 | Dr. GRPO、DAPO、GSPO-token、RLOO 等 | 已有实现和限定配置下的实验，尚未覆盖所有模型与参数组合 |
 | TopK、Top-p 生成 | 已有 CPU/TPU 测试；RL 入口目前使用温度 1 的完整词表采样 |
-| tpu-inference | 实验性接入；完整的跨后端质量、成本和故障处理比较仍在进行 |
+| tpu-inference | 实验性接入；同进程默认通过 ICI 同步，另有主机中转及共同分布式运行时的双进程对照；完整质量与成本比较仍在进行 |
 | E4B、12B LoRA | E4B 有独立实验；12B 仍需完成真实 TPU 训练和恢复验证 |
 
-## 文档
+当前 ICI 和分块保存代码已通过 TPU v4 数组测试，迁移后的完整 E2B 训练、保存和独立续训仍需重新验证。引擎使用单独的固定依赖环境，适用范围见[整体设计](docs/design-overview.md)。实验报告将在后续整理发布。
 
-文档集中在四个文件中，每篇都包含对应主题的完整说明：
+## 使用、设计与算法
 
-| 文档 | 内容 |
+| 文档 | 阅读后可以了解什么 |
 |---|---|
-| [安装与使用](docs/quickstart.md) | 环境准备、生成、SFT、GRPO、保存和继续训练、评估、数值与性能实验 |
-| [实现说明](docs/architecture.md) | 模型结构、训练目标、采样概率、设备分片和状态恢复 |
-| [实验结果与分析](docs/development-results.md) | 模型精度、训练效果、词表并行、采样精度与权重同步的定位过程、可运行小实验及其他研究结果 |
-| [测试方法与运行记录](docs/validation.md) | 测试命令、实际运行环境、通过的检查和尚未覆盖的范围 |
+| [快速开始](docs/quickstart.md) | 怎样安装、准备模型、运行生成和训练，以及保存后如何继续 |
+| [整体设计](docs/design-overview.md) | 数据如何经过模型、生成与训练，各模块如何管理参数、设备和持久状态 |
+| [GRPO 及相关算法](docs/grpo-and-related-algorithms.md) | 奖励怎样变成梯度，概率比裁剪和 Adam 怎样影响参数，各算法具体改了哪一步 |
 
-`gemma4_posttrain_jax/` 是 Python 包，`scripts/` 提供运行命令，`examples/` 组合训练步骤，`tests/` 保存测试。实验结果和分析写在文档中；运行脚本生成的数据、日志和编译图保存在本地 `outputs/`。
+
+`gemma4_posttrain_jax/` 是 Python 包，`scripts/` 提供运行命令，`examples/` 组合训练步骤，`tests/` 保存测试。运行生成的数据、日志和编译图保存在使用者指定的输出目录。
 
 源码采用[MIT](LICENSE)。模型、tokenizer、数据集和外部依赖的许可分别适用。

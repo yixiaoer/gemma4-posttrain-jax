@@ -13,4 +13,4 @@ wandb/
 .env
 .DS_Store
 
-experiments/*
+/experiments/

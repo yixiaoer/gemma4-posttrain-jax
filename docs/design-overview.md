@@ -98,23 +98,31 @@ SFT 保存数据流状态；原生 GRPO 单独记录候选批次位置 `data_cur
 
 现有支持主要针对单主机及已验证配置；跨主机、任意布局改变后的相同轨迹、解码中途及异步队列恢复需要单独实现和验证。[GRPO 恢复示例](../examples/e2b_grpo_recovery.sh)组合连续训练、独立恢复、重载评估及结果比较。
 
-## 6. 外部推理后端
+## 6. 原生 rollout 与 tpu-inference
 
-[InferenceRollout](../gemma4_posttrain_jax/inference_rollout.py) 将 tpu-inference 接入同一生成接口。训练器保留主参数和优化器，适配层完成参数同步、版本检查和生成结果转换；[权重映射与检查](../gemma4_posttrain_jax/inference_weights.py)处理引擎需要的类型、布局及内容验证。
+原生 JAX rollout 是默认生成路径，使用 `--rollout-backend jax`。接入 tpu-inference 时，**推荐训练与引擎模型执行位于同一进程，通过 ICI 同步权重**：选择 `--rollout-backend inference`，保留 `--inference-weight-transport auto` 即使用这一路径。
 
-当前训练入口区分四种配置：
+ICI（Inter-Chip Interconnect）是 TPU 的芯片间互联，原生 rollout 也会使用。两种生成后端的区别在于设备如何分配、权重在哪里使用，以及何时需要交换数据：
 
-| `--rollout-backend` | 模型执行与设备使用 |
+| 生成路径 | 当前设备使用方式 | ICI 通信在做什么 |
+|---|---|---|
+| 原生 rollout，默认 `--rollout-layout replicated` | 训练和生成轮流使用同一组四个 chip；生成时每个 chip 有完整 BF16 权重 | 生成前，将训练时分片存储的权重转换为各 chip 的完整副本，需要跨芯片汇集数据 |
+| 原生 rollout，`--rollout-layout fsdp` | 训练和生成仍使用同一组四个 chip；生成权重继续分片 | 生成计算中，由 JAX/XLA 根据分片布局安排所需的跨芯片通信 |
+| tpu-inference，推荐的同进程 ICI 配置 | 训练与引擎共享进程和 JAX 运行时；当前默认训练两芯、推理两芯 | 将训练侧最新权重传给另一组推理 chip，并转换成引擎所需的类型和布局 |
+
+原生路径的权重转换由 [reshard_for_rollout](../gemma4_posttrain_jax/sharding.py) 完成。训练和生成使用同一组 chip，仍可能需要重分片通信；默认复制布局在生成前准备完整权重，不要求每个 decode step 都重新同步整套权重。
+
+[InferenceRollout](../gemma4_posttrain_jax/inference_rollout.py) 将 tpu-inference 接入同一生成接口。训练器保留主参数和优化器，适配层完成参数同步、版本检查和生成结果转换；[权重映射与检查](../gemma4_posttrain_jax/inference_weights.py)处理引擎需要的类型、布局及内容验证。参数同步携带递增版本，生成请求与返回结果核对期望版本；引擎后端同时负责权重切换后的缓存失效、随机状态和进程生命周期。
+
+这里的“同进程”指训练计算与引擎模型执行在同一个进程中，仍允许辅助子进程。当前接入在导入引擎前设置 `VLLM_ENABLE_V1_MULTIPROCESSING=0` 和 `TPU_MULTIPROCESS_DP=0`，并核对实际使用 `InprocClient` 及 `UniProcExecutor`；DP 调度器仍会启动 CPU 调度子进程。本项目通过 Python 接口调用推理引擎，无需另启 HTTP 服务。
+
+其余进程和传输方案仅保留为开发过程中的对照实现，用于复现和分析不同运行时、权重传输与进程隔离行为，不作为常规使用推荐：
+
+| 开发对照配置 | 保留的实现 |
 |---|---|
-| `jax` | 原生 JAX rollout，与训练共享进程和训练 mesh；当前四芯配置默认轮流使用同一组四芯设备 |
-| `inference` | tpu-inference 的模型执行与训练共享进程和 JAX 运行时；当前默认训练两芯、推理两芯，权重通过 ICI 同步 |
-| `inference-process` | 在独立 Python 进程中构造 tpu-inference，训练和推理可使用不同依赖环境；当前各使用两芯 |
-| `inference-distributed` | 两个 Python 模型进程使用相同 JAX/libtpu 环境，共同初始化分布式运行时；各持有两芯，权重通过 ICI 同步 |
+| `--rollout-backend inference-process` | 两个独立 Python 进程和 JAX 运行时，可使用不同依赖环境；当前各使用两芯，通过主机中转权重 |
+| `--rollout-backend inference-distributed` | 两个 Python 模型进程使用相同 JAX/libtpu 环境，共同初始化分布式运行时；当前各持有两芯，通过 ICI 同步权重 |
 
-`--inference-weight-transport auto` 为 `inference` 和 `inference-distributed` 选择设备传输，为 `inference-process` 选择主机中转。后者保留独立运行时，不能只改一个传输选项就加入共同的通信组。`inference-distributed` 要求调用方先建立两进程分布式运行时，再分别启动训练与接收端；直接执行训练脚本不会自动完成这一步。本版提供框架实现和接口测试，专用部署启动器随实验材料后续整理，不将它作为开箱即用的训练示例。同进程是当前优先使用的引擎配置，双进程用于部署与故障行为研究，两者尚无同条件的完整训练速度排名。
+`--inference-weight-transport auto` 在上述两种开发配置中分别选择主机中转和 ICI。共同分布式运行时需要调用方预先建立，再分别启动训练与接收端；仅切换传输选项或直接运行训练脚本不会自动完成初始化。这些双进程实现不表示训练与生成已经重叠执行。
 
-这里的“同进程”指训练计算与引擎模型执行在同一个进程中，不表示没有辅助子进程。当前接入在导入引擎前设置`VLLM_ENABLE_V1_MULTIPROCESSING=0`和`TPU_MULTIPROCESS_DP=0`，并核对实际使用`InprocClient`及`UniProcExecutor`；DP调度器仍会启动CPU调度子进程。推理引擎也不必以HTTP服务运行，本项目通过Python接口调用它。
-
-参数同步携带递增版本，生成请求与返回结果核对期望版本。引擎后端同时负责权重切换后的缓存失效、随机状态和进程生命周期。版本一致只是接口条件，仍需通过生成、训练、保存与恢复的完整实验检查行为。
-
-同进程和独立进程路径目前均为实验接入，依赖对应的引擎环境与 libtpu；独立进程本身不代表训练与生成已经重叠执行。本版不提供两种进程布局的完整训练速度排名；同步数组测试不能替代真实模型的训练、保存与恢复验证。
+tpu-inference 接入仍依赖对应的固定引擎环境与 libtpu，完整模型的生成、训练、保存与恢复需要按配置验证。同步数组测试只覆盖传输本身；当前也没有这些进程布局在相同条件下的完整训练速度排名。

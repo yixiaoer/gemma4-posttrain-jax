@@ -1,3 +1,3 @@
-"""Gemma 4的函数式JAX后训练：模型、SFT、RL、采样与完整状态管理。"""
+"""Functional Gemma 4 post-training in JAX."""
 
 __version__ = "0.0.1"

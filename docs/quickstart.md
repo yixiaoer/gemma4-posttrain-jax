@@ -21,7 +21,7 @@ JAX_PLATFORMS=cpu .venv/bin/python scripts/check_env.py --backend cpu
 
 CPU 模式只检查版本和矩阵计算；TPU 模式还会跑一个小 Pallas kernel。
 
-以上安装用于原生 JAX 路径。tpu-inference 适配层依赖固定版本与源码，不能直接在引擎环境执行这组升级命令。同进程 ICI 和双进程接口的适用范围见[整体设计](design-overview.md)；它们仍属于实验配置。
+以上安装用于原生 JAX 路径。tpu-inference 适配层依赖固定版本与源码，不能直接在引擎环境执行这组升级命令。接入引擎时推荐同进程执行、通过 ICI 同步权重；双进程和主机中转仅保留为开发对照。该接入仍属于实验配置，具体区别与适用范围见[整体设计](design-overview.md)。
 
 **模型准备：** 下载 `google/gemma-4-E2B-it` 到本地目录（需包含配置、tokenizer、safetensors 权重）。下文统一用 `/path/to/e2b-snapshot` 指代，运行前替换成实际路径。
 

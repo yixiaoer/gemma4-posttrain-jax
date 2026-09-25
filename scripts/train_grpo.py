@@ -50,6 +50,7 @@ from gemma4_posttrain_jax.diagnostics import (
     source_git_state,
 )
 from gemma4_posttrain_jax.evaluation import evaluate_batches, make_eval_sampler, prepare_eval_batches
+from gemma4_posttrain_jax.logprob_protocol import logprob_run_metadata
 from gemma4_posttrain_jax.lora import LoRAConfig, check_lora_config, init_lora_params, prepare_lora_params
 from gemma4_posttrain_jax.lora_training import LoRAPolicyParams, lora_base_identity, make_lora_optimizer
 from gemma4_posttrain_jax.losses import (
@@ -210,6 +211,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remat", action="store_true")
     parser.add_argument("--vocab-chunk", type=int, default=8192)
     parser.add_argument("--sequence-chunk", type=int, default=256)
+    parser.add_argument(
+        "--logprob-backend",
+        choices=("jax", "pallas"),
+        default="jax",
+        help="logprob 后端；pallas 为四芯片 TPU v4/BF16 实验选项，长期 GRPO 数值差异尚未解决",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--reward-workers", type=int, default=4)
     parser.add_argument("--save-every", type=int, default=0)
@@ -241,6 +248,15 @@ def parse_args() -> argparse.Namespace:
     from gemma4_posttrain_jax.inference_runtime import resolve_weight_sync_transport
 
     args = parser.parse_args()
+    if args.logprob_backend == "pallas":
+        if (args.vocab_chunk, args.sequence_chunk) != (8192, 256):
+            parser.error("Pallas logprob requires vocab-chunk=8192 and sequence-chunk=256")
+        if args.rollout_backend != "jax" or args.lora_rank is not None:
+            parser.error(
+                "Pallas logprob currently requires native rollout and full-model training on four TPU v4 chips"
+            )
+        if args.training_device_ids is not None and len(set(args.training_device_ids)) != 4:
+            parser.error("Pallas logprob requires exactly four training devices")
     args.inference_weight_transport = resolve_weight_sync_transport(
         args.rollout_backend, args.inference_weight_transport
     )
@@ -518,6 +534,10 @@ def main() -> None:
     elif process_inference and sorted(devices_by_id) != [0, 1]:
         raise ValueError("独立进程训练必须实际只看到两个本地TPU设备")
     mesh = make_mesh([devices_by_id[index] for index in training_ids])
+    if args.logprob_backend == "pallas" and (
+        mesh.size != 4 or any("TPU v4" not in device.device_kind for device in mesh.devices.flat)
+    ):
+        raise ValueError("Pallas logprob requires four TPU v4 chips in the training mesh")
     device_allocation = iteration_device_allocation(args.rollout_backend, training_ids, args.inference_device_ids)
     rows = args.prompt_batch_size * args.group_size
     if rows % mesh.size:
@@ -598,6 +618,7 @@ def main() -> None:
         "jaxlib": importlib.metadata.version("jaxlib"),
         "libtpu": optional_package_version("libtpu"),
     }
+    run_config.update(logprob_run_metadata(args.logprob_backend))
     if args.training_device_ids is not None:
         run_config["training_device_ids"] = training_ids
     if args.rollout_backend != "jax":
@@ -873,6 +894,7 @@ def main() -> None:
             microbatch_size=args.microbatch_size,
             remat_layers=args.remat,
             mesh=mesh,
+            logprob_backend=args.logprob_backend,
             lora=None if lora_config is None else prepare_lora_params(current.adapters_f32, lora_config),
         ),
         in_shardings=(parameter_shardings,) + (batch_sharding,) * 4,
@@ -910,6 +932,7 @@ def main() -> None:
             sequence_chunk=args.sequence_chunk,
             remat_layers=args.remat,
             mesh=mesh,
+            logprob_backend=args.logprob_backend,
             beta=args.beta,
             kl_clamp_value=args.kl_clamp_value,
             microbatch_size=args.microbatch_size,

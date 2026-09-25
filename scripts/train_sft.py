@@ -23,6 +23,7 @@ from gemma4_posttrain_jax.bench import device_peak_bytes
 from gemma4_posttrain_jax.checkpoint import load_train_state, read_checkpoint_metadata, save_train_state
 from gemma4_posttrain_jax.data import GSM8KBatchStream, collate_sft, encode_sft_example, load_gsm8k
 from gemma4_posttrain_jax.diagnostics import optional_package_version, source_git_state
+from gemma4_posttrain_jax.logprob_protocol import logprob_run_metadata
 from gemma4_posttrain_jax.losses import init_train_state, make_optimizer, train_step
 from gemma4_posttrain_jax.sharding import (
     batch_spec,
@@ -54,6 +55,8 @@ RESUME_CONFIG_FIELDS = (
     "vocab_chunk",
     "sequence_chunk",
     "vocab_parallel",
+    "logprob_backend",
+    "logprob_protocol",
     "remat_layers",
     "mesh_shape",
     "mesh_axis_names",
@@ -75,6 +78,12 @@ def parse_args() -> argparse.Namespace:
         "--freeze-embeddings", action="store_true", help="full-core FT: freeze token and PLE lookup tables"
     )
     parser.add_argument("--compute-dtype", choices=("bf16", "f32"), default="bf16")
+    parser.add_argument(
+        "--logprob-backend",
+        choices=("jax", "pallas"),
+        default="jax",
+        help="logprob 后端；pallas 为四芯片 TPU v4/BF16 实验选项，默认使用 jax",
+    )
     parser.add_argument("--vocab-chunk", type=int, default=8192)
     parser.add_argument("--sequence-chunk", type=int, default=256)
     parser.add_argument(
@@ -107,7 +116,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="fail if the JIT train step creates more than one in-process executable cache entry",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.logprob_backend == "pallas" and (
+        not args.vocab_parallel
+        or args.compute_dtype != "bf16"
+        or (args.vocab_chunk, args.sequence_chunk) != (8192, 256)
+    ):
+        parser.error("Pallas logprob requires BF16, vocabulary parallelism, vocab-chunk=8192 and sequence-chunk=256")
+    return args
 
 
 def resolve_model_path(value: str | None) -> str:
@@ -141,6 +157,9 @@ def estimated_mfu(*, tokens: int, elapsed_s: float) -> float:
 def validate_resume_config(saved: Mapping[str, Any], current: Mapping[str, Any]) -> None:
     """Refuse a continuation whose model, optimizer, data shape, or JIT controls changed."""
 
+    # 未记录后端的旧 checkpoint 使用原生 JAX。
+    saved = {"logprob_backend": "jax", **saved}
+    current = {"logprob_backend": "jax", **current}
     fields = RESUME_CONFIG_FIELDS + (("seed",) if current.get("mode") == "gsm8k" else ())
     differences = {
         field: {"saved": saved.get(field), "current": current.get(field)}
@@ -211,6 +230,7 @@ def main() -> None:
         "vocab_chunk": args.vocab_chunk,
         "sequence_chunk": args.sequence_chunk,
         "vocab_parallel": args.vocab_parallel,
+        "logprob_backend": args.logprob_backend,
         "remat_layers": args.remat,
         "seed": args.seed,
         "shape_policy": "fixed padded [batch_size, sequence_length], drop remainder before reshuffle",
@@ -227,6 +247,7 @@ def main() -> None:
         "mesh_axis_names": list(mesh.axis_names),
         "devices": [device.device_kind for device in jax.devices()],
     }
+    run_config.update(logprob_run_metadata(args.logprob_backend))
     load_start = time.perf_counter()
     host_params, config = load_hf_params(model_path, dtype=jnp.float32)
     params = shard_gemma4_text_params(host_params, config, mesh)
@@ -273,6 +294,7 @@ def main() -> None:
             sequence_chunk=args.sequence_chunk,
             remat_layers=args.remat,
             mesh=mesh if args.vocab_parallel else None,
+            logprob_backend=args.logprob_backend,
         ),
         donate_argnums=(0,),
         in_shardings=(state_shardings, batch_sharding, batch_sharding, batch_sharding),

@@ -20,6 +20,7 @@
 | tpu-inference | 实验性生成后端，推荐同进程接入并通过 ICI 向推理芯片同步权重；双进程方案（经主机中转或共用分布式运行时）仅保留为开发对照，区别与配置见[整体设计](docs/design-overview.md) |
 | 保存与恢复 | 分块写出设备数组，保存参数、优化器状态及续训所需的随机配置和数据位置；按目标分片加载，提供连续训练与新进程续训的比较脚本 |
 | 数据、评估与诊断 | GSM8K、MATH 数据处理与奖励计算，独立评估和训练期间评估；记录训练指标、概率差异、编译与内存信息，可选接入 W&B |
+| Pallas LM-head/logprob | 四芯片 TPU v4、BF16 的可选训练后端；保留原生前向和 hidden 梯度，用 Pallas 计算部分权重梯度，目前仍为实验选项|
 | 单 chip Pallas attention | 针对 TPU v4 的 Splash 前向、反向、双 TensorCore 分工与存储优化；目前是独立实验实现 |
 
 各部分的实现细节见[整体设计](docs/design-overview.md)，各算法的区别见[GRPO 及相关算法](docs/grpo-and-related-algorithms.md)。
@@ -29,7 +30,7 @@
 - 主要验证环境是 E2B 和单机 TPU v4-8；E4B 有部分实验。
 - 12B LoRA 尚需在真实 TPU 上完成训练与恢复验证。
 - tpu-inference 的 ICI 权重同步和 checkpoint 分块保存已通过 TPU 数组测试，但这不能替代完整 E2B 训练、保存和新进程续训的验证（后者仍待完成）。
-- 分块 logprob 和词表并行已用于训练；Pallas attention 的局部结果仍需在完整模型中验证。
+- 分块 logprob 和词表并行已用于训练；Pallas LM-head/logprob 需显式启用，长期 GRPO 数值差异尚未解决。Pallas attention 的局部结果仍需在完整模型中验证。
 
 **已知限制**
 

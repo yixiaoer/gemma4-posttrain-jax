@@ -157,14 +157,36 @@ def _vocab_parallel_logps(
     vocab_chunk: int,
     sequence_chunk: int,
 ) -> Array:
-    """Keep ``[V,H]`` sharded and combine local target/logsumexp statistics."""
+    """保留词表分片，返回所选 token 的 logprob。"""
+    return _vocab_parallel_logps_and_normalization(
+        embed_tokens,
+        hidden,
+        targets,
+        mesh=mesh,
+        softcap=softcap,
+        vocab_chunk=vocab_chunk,
+        sequence_chunk=sequence_chunk,
+    )[0]
+
+
+def _vocab_parallel_logps_and_normalization(
+    embed_tokens: Array,
+    hidden: Array,
+    targets: Array,
+    *,
+    mesh: Mesh,
+    softcap: float | None,
+    vocab_chunk: int,
+    sequence_chunk: int,
+) -> tuple[Array, Array]:
+    """保留原生浮点顺序，并额外返回全局 maximum/sum。"""
 
     if DATA_AXIS not in mesh.axis_names:
         raise ValueError(f"vocab-parallel mesh needs axis {DATA_AXIS!r}: {mesh.axis_names}")
     if embed_tokens.shape[0] % mesh.shape[DATA_AXIS]:
         raise ValueError(f"vocab size {embed_tokens.shape[0]} must be divisible by mesh axis {mesh.shape[DATA_AXIS]}")
 
-    def local_logps(local_embed: Array, replicated_hidden: Array, replicated_targets: Array) -> Array:
+    def local_logps(local_embed: Array, replicated_hidden: Array, replicated_targets: Array) -> tuple[Array, Array]:
         output_shape = replicated_targets.shape
         hidden_size = replicated_hidden.shape[-1]
         token_count = math.prod(output_shape)
@@ -182,7 +204,7 @@ def _vocab_parallel_logps(
         block_indices = jnp.arange(vocabulary_blocks, dtype=jnp.int32)
         vocabulary_offset = lax.axis_index(DATA_AXIS) * local_vocab_size
 
-        def sequence_body(_: None, inputs: tuple[Array, Array]) -> tuple[None, Array]:
+        def sequence_body(_: None, inputs: tuple[Array, Array]) -> tuple[None, tuple[Array, Array]]:
             hidden_block, target_block = inputs
             owned = (target_block >= vocabulary_offset) & (target_block < vocabulary_offset + local_vocab_size)
             local_targets = jnp.clip(target_block - vocabulary_offset, 0, local_vocab_size - 1)
@@ -220,22 +242,25 @@ def _vocab_parallel_logps(
             # JAX 0.11.1 has no pmax transpose rule; stopping the pmax output is already too late for AD tracing.
             global_max = lax.pmax(lax.stop_gradient(local_max), DATA_AXIS)
             global_sum = lax.psum(local_sum * jnp.exp(local_max - global_max), DATA_AXIS)
-            return None, target_logits - global_max - jnp.log(global_sum)
+            values = target_logits - global_max - jnp.log(global_sum)
+            return None, (values, jnp.stack((global_max, global_sum)))
 
-        _, blocks = lax.scan(sequence_body, None, (hidden_blocks, target_blocks))
-        return blocks.reshape(-1)[:token_count].reshape(output_shape)
+        _, (blocks, normalization) = lax.scan(sequence_body, None, (hidden_blocks, target_blocks))
+        values = blocks.reshape(-1)[:token_count].reshape(output_shape)
+        normalization = jnp.moveaxis(normalization, 1, 0).reshape(2, -1)[:, :token_count]
+        return values, normalization.reshape((2, *output_shape))
 
     mapped = jax.shard_map(
         local_logps,
         mesh=mesh,
         in_specs=(P(DATA_AXIS, None), P(), P()),
-        out_specs=P(),
+        out_specs=(P(), P()),
         axis_names={DATA_AXIS},
     )
     return mapped(embed_tokens, hidden, targets)
 
 
-def per_token_logps(
+def _jax_per_token_logps(
     embed_tokens: Array,
     hidden: Array,
     targets: Array,
@@ -277,6 +302,45 @@ def per_token_logps(
         vocab_chunk=vocab_chunk,
         sequence_chunk=sequence_chunk,
     )
+
+
+def per_token_logps(
+    embed_tokens: Array,
+    hidden: Array,
+    targets: Array,
+    *,
+    softcap: float | None,
+    vocab_chunk: int = 8192,
+    sequence_chunk: int = 256,
+    mesh: Mesh | None = None,
+    backend: str = "jax",
+) -> Array:
+    """按显式后端计算 selected logprob；默认保持原生流式词表并行。"""
+    if backend == "jax":
+        return _jax_per_token_logps(
+            embed_tokens,
+            hidden,
+            targets,
+            softcap=softcap,
+            vocab_chunk=vocab_chunk,
+            sequence_chunk=sequence_chunk,
+            mesh=mesh,
+        )
+    if backend == "pallas":
+        from gemma4_posttrain_jax.pallas.lm_head_logprob_tpuv4 import per_token_logps as training_logps
+
+        return training_logps(
+            embed_tokens,
+            hidden,
+            targets,
+            native_logps=_jax_per_token_logps,
+            native_logps_and_normalization=_vocab_parallel_logps_and_normalization,
+            softcap=softcap,
+            vocab_chunk=vocab_chunk,
+            sequence_chunk=sequence_chunk,
+            mesh=mesh,
+        )
+    raise ValueError(f"unknown logprob backend: {backend}")
 
 
 def cast_floating_tree(tree: Any, dtype: Any) -> Any:
@@ -541,6 +605,7 @@ def trainer_completion_logps(
     sequence_chunk: int = 256,
     remat_layers: bool = False,
     mesh: Mesh | None = None,
+    logprob_backend: str = "jax",
     microbatch_size: int | None = None,
     lora: Gemma4LoRAParams | None = None,
 ) -> Array:
@@ -577,6 +642,7 @@ def trainer_completion_logps(
                     sequence_chunk=sequence_chunk,
                     remat_layers=remat_layers,
                     mesh=mesh,
+                    logprob_backend=logprob_backend,
                     lora=lora,
                 )
 
@@ -611,6 +677,7 @@ def trainer_completion_logps(
             vocab_chunk=vocab_chunk,
             sequence_chunk=sequence_chunk,
             mesh=mesh,
+            backend=logprob_backend,
         )
     return jnp.where(completion_mask, logps, 0.0)
 
@@ -658,6 +725,7 @@ def grpo_train_step[Params](
     sequence_chunk: int = 256,
     remat_layers: bool = False,
     mesh: Mesh | None = None,
+    logprob_backend: str = "jax",
     eps_low: float = 0.2,
     eps_high: float = 0.2,
     beta: float = 0.0,
@@ -762,6 +830,7 @@ def grpo_train_step[Params](
             sequence_chunk=sequence_chunk,
             remat_layers=remat_layers,
             mesh=mesh,
+            logprob_backend=logprob_backend,
             lora=lora,
         )
         loss, _ = loss_from_logps(policy_logps, batch)
@@ -813,6 +882,7 @@ def sft_loss(
     sequence_chunk: int = 256,
     remat_layers: bool = False,
     mesh: Mesh | None = None,
+    logprob_backend: str = "jax",
 ) -> Array:
     """Mean next-token negative log-likelihood; ``labels == -100`` tokens are ignored."""
 
@@ -850,6 +920,7 @@ def sft_loss(
             vocab_chunk=vocab_chunk,
             sequence_chunk=sequence_chunk,
             mesh=mesh,
+            backend=logprob_backend,
         )
     token_count = jnp.maximum(loss_mask.sum(), 1)
     return -jnp.where(loss_mask, logps, 0.0).sum() / token_count
@@ -917,6 +988,7 @@ def train_step(
     sequence_chunk: int = 256,
     remat_layers: bool = False,
     mesh: Mesh | None = None,
+    logprob_backend: str = "jax",
 ) -> tuple[TrainState, TrainMetrics]:
     """One SFT step over f32 master parameters, optionally rematerializing decoder layers."""
 
@@ -937,6 +1009,7 @@ def train_step(
             sequence_chunk=sequence_chunk,
             remat_layers=remat_layers,
             mesh=mesh,
+            logprob_backend=logprob_backend,
         )
 
     with jax.named_scope("sft_forward_backward"):

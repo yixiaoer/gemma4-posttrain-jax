@@ -73,6 +73,8 @@ RL 入口依次组织问题、生成回答、评分、计算 advantage（优势�
 
 训练 logprob 分块计算 log-sum-exp，并提取目标 token 分数，减少完整 `[batch, sequence, vocabulary]` logits 的存储。显式词表并行进一步让各设备处理自己的词表区间，合并归一化统计量，控制大权重的通信。实现集中在 [losses.py](../gemma4_posttrain_jax/losses.py)。
 
+`--logprob-backend pallas` 在上述词表并行基础上，保留原生前向、hidden 梯度和目标 token 的权重梯度，用 Pallas 计算归一化项的权重梯度。它只覆盖当前四芯片 TPU v4/BF16 配置，默认仍为 `jax`，也不替换生成时的输出头。
+
 内存控制分别作用于不同对象：microbatch 减小同时计算的样本数；重计算（rematerialization，remat）减少保留的激活；buffer donation 允许编译器复用调用后不再使用的输入存储。训练入口在实际 Adam 更新函数上验证内存和耗时，诊断函数返回全部梯度时的结果单独记录。
 
 策略名称不等于模型副本数。当前训练的主要存储如下：
@@ -95,6 +97,8 @@ checkpoint（检查点）由数组文件和元数据组成。`state.safetensors`
 SFT 保存数据流状态；原生 GRPO 单独记录候选批次位置 `data_cursor`，使用 `fold_in(base_key, data_cursor)` 派生随机 key。动态补采中被过滤的候选也推进这一位置，因此不能用 Adam 的 `step` 代替。启用顺序滞后生成时，还需保存行为策略快照及版本。
 
 当前 GRPO 的保存点位于完整 μ 次更新结束后。下一轮重新生成，可以重建 KV cache，无需保存半轮解码和未完成的梯度累积。恢复进程重新建立 mesh、目标分片和编译函数，文件不保存旧设备对象或 executable。
+
+使用 Pallas logprob 时，训练配置还记录后端和数值实现版本；SFT/GRPO 恢复均检查这些字段。未记录后端的旧 JAX checkpoint 保持兼容，切换后端需要开始新运行。
 
 现有支持主要针对单主机及已验证配置；跨主机、任意布局改变后的相同轨迹、解码中途及异步队列恢复需要单独实现和验证。[GRPO 恢复示例](../examples/e2b_grpo_recovery.sh)组合连续训练、独立恢复、重载评估及结果比较。
 

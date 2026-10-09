@@ -1,4 +1,4 @@
-"""在真实tiny模型上验证host的μ更新、固定old、RNG/数据游标和完整恢复。"""
+"""Host loop on a real tiny model: mu updates, frozen old logprobs, RNG/data cursor and full resume."""
 
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ def test_mu_two_host_loop_resume_preserves_old_batch_and_full_state(
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: TinyTokenizer())
 
     def rewards(completions, golds, **kwargs):
-        # 仅替换评分器，完整生成、logprob、梯度、Adam、保存/恢复使用实现。
+        # Only the reward function is replaced; generation, logprobs, gradients, Adam and save/resume are real.
         success = np.asarray([0, 0, 0, 1], np.float32) if dynamic else np.arange(len(completions), dtype=np.float32) % 2
         zeros = np.zeros_like(success)
         return RewardOutput(success, success, zeros, zeros, success)
@@ -114,7 +114,7 @@ def test_mu_two_host_loop_resume_preserves_old_batch_and_full_state(
 
     def record_call(fn, *arguments):
         is_update = bool(arguments) and isinstance(arguments[0], TrainState)
-        # donation会释放旧state；先记录step和传入的冻结数组。
+        # Donation frees the old state, so record the step and the frozen input array first.
         before_step = int(arguments[0].step) if is_update else None
         frozen = np.asarray(arguments[6]).copy() if is_update else None
         captured = bool(arguments[-2] if lora else arguments[-1]) if is_update else False
@@ -204,7 +204,7 @@ def test_mu_two_host_loop_resume_preserves_old_batch_and_full_state(
         return output, checkpoint_dir
 
     if dynamic and attempt_budget == 1:
-        with pytest.raises(RuntimeError, match="未更新参数"):
+        with pytest.raises(RuntimeError, match="parameters were not updated"):
             run("exhausted")
         assert not old_snapshots
         assert not list((tmp_path / "checkpoints_exhausted").iterdir())
@@ -262,7 +262,7 @@ def test_mu_two_host_loop_resume_preserves_old_batch_and_full_state(
     assert saved_config["kl_clamp_value"] == kl_clamp_value
     assert saved_config.get("rollout_layout", "replicated") == rollout_layout
     assert ("rollout_layout" in saved_config) == (rollout_layout == "fsdp")
-    with pytest.raises(ValueError, match="恢复配置|首个LoRA"):
+    with pytest.raises(ValueError, match="resume configuration|LoRA currently requires"):
         run(
             "changed_rollout_layout",
             continuous_checkpoints / "step_00000002",
@@ -271,7 +271,7 @@ def test_mu_two_host_loop_resume_preserves_old_batch_and_full_state(
     assert saved_config.get("prompt_style", "chat") == prompt_style
     assert ("prompt_protocol" in saved_config) == (prompt_style == "plain")
     assert np.all(exported["prompt_ids"][:, : (2 if prompt_style == "plain" else 1)] == 0)
-    with pytest.raises(ValueError, match="恢复配置"):
+    with pytest.raises(ValueError, match="resume configuration"):
         run(
             "changed_prompt_style",
             continuous_checkpoints / "step_00000002",
@@ -300,7 +300,7 @@ def test_mu_two_host_loop_resume_preserves_old_batch_and_full_state(
             return record
 
         monkeypatch.setattr(trainer, "read_checkpoint_metadata", changed_sampling)
-        with pytest.raises(ValueError, match="恢复配置"):
+        with pytest.raises(ValueError, match="resume configuration"):
             run(f"changed_{field}_{value}", continuous_checkpoints / "step_00000002")
 
     def read_legacy_checkpoint(path):
@@ -361,7 +361,7 @@ def test_mu_two_host_loop_resume_preserves_old_batch_and_full_state(
         weights = model_path / "model.safetensors"
         data = weights.read_bytes()
         weights.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
-        with pytest.raises(ValueError, match="恢复配置"):
+        with pytest.raises(ValueError, match="resume configuration"):
             run("changed_base_bytes", continuous_checkpoints / "step_00000002")
         if evaluator is not None:
             assert evaluation_command is not None

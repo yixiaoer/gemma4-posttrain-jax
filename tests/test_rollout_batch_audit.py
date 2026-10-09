@@ -1,4 +1,4 @@
-"""用小模型的实际生成和 Adam 更新检查样本记录，包括动态补采中被丢弃的样本。"""
+"""Rollout records from real generation and updates on a tiny model, including samples dropped by filtering."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from safetensors.numpy import load_file
 from test_grpo_host_loop import TinyDataset, TinyTokenizer
 
@@ -18,6 +19,8 @@ from gemma4_posttrain_jax.rewards import RewardOutput
 
 
 def test_audit_preserves_state_and_all_candidate_arrays(tpu_grad_tiny, tmp_path, monkeypatch):
+    if len(jax.devices()) != 1:
+        pytest.skip("written for a single CPU device; run this file without XLA_FLAGS")
     _, params, config = tpu_grad_tiny
     path = Path(__file__).resolve().parents[1] / "scripts/train_grpo.py"
     spec = importlib.util.spec_from_file_location("rollout_audit_driver", path)
@@ -35,7 +38,7 @@ def test_audit_preserves_state_and_all_candidate_arrays(tpu_grad_tiny, tmp_path,
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **kw: TinyTokenizer())
 
     def rewards(completions, golds, **kwargs):
-        # 每批仅第二组符合补采筛选；生成和训练仍使用真实实现。
+        # Only the second group of each batch passes dynamic sampling; generation and training are real.
         success = np.asarray([0, 0, 0, 1], np.float32)
         zero = np.zeros_like(success)
         return RewardOutput(success, success, zero, zero, success)

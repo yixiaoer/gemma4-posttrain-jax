@@ -1,4 +1,4 @@
-"""真实tiny模型的一次Adam滞后、行为概率、TIS与包含快照的原子恢复。"""
+"""One-update lag, behavior probabilities, TIS and atomic resume with the behavior snapshot on a real tiny model."""
 
 from __future__ import annotations
 
@@ -187,12 +187,14 @@ def run_lagged_host_case(
         expected_is = np.minimum(np.exp(exported["old_logps"] - exported["rollout_logps"]), is_cap)
         expected_is = np.where(exported["completion_mask"], expected_is, 0)
         np.testing.assert_allclose(exported["sampler_is_weights"], expected_is, atol=1e-6, rtol=1e-6)
-    # H2在同一行为版本比较；当前target的跨版本变化单独保存。
+    # The sampler/trainer drift compares the same behavior version;
+    # cross-version changes of the target are stored separately.
     drift = json.loads((resumed / "startup_drift.json").read_text())
     assert drift["delta_definition"] == "standalone_behavior_trainer_logp - behavior_rollout_full_policy_logp"
 
     if dynamic:
-        # 独立评估入口读取带滞后快照的checkpoint，但用当前训练参数做greedy评估。
+        # The evaluation entry point reads a checkpoint with a lag snapshot,
+        # but evaluates the current training parameters greedily.
         from gemma4_posttrain_jax.evaluation import EvaluationData
 
         eval_path = path.parent / "evaluate_gsm8k.py"
@@ -258,7 +260,7 @@ def run_lagged_host_case(
             return metadata
 
         monkeypatch.setattr(trainer, "read_checkpoint_metadata", read_previous_tis_protocol)
-        with pytest.raises(ValueError, match="恢复配置"):
+        with pytest.raises(ValueError, match="resume configuration"):
             run("legacy_tis_protocol", continuous_states / "step_00000002")
 
 
@@ -269,6 +271,8 @@ def run_lagged_host_case(
 def test_lagged_rollout_uses_previous_update_and_restores_complete_state(
     grad_tiny, tmp_path: Path, monkeypatch, mu: int, is_cap: float | None, dynamic: bool
 ) -> None:
+    if len(jax.devices()) != 1:
+        pytest.skip("written for a single CPU device; run this file without XLA_FLAGS")
     run_lagged_host_case(grad_tiny, tmp_path, monkeypatch, mu, is_cap, dynamic)
 
 
@@ -282,8 +286,11 @@ def test_tpu_lagged_rollout_restores_host_snapshot_and_four_shard_training(
 
 
 def test_plain_lagged_resume_and_independent_eval(grad_tiny, tmp_path: Path, monkeypatch) -> None:
+    if len(jax.devices()) != 1:
+        pytest.skip("written for a single CPU device; run this file without XLA_FLAGS")
+
     def forbidden_chat(*args, **kwargs):
-        raise AssertionError("plain路径不应调用chat template")
+        raise AssertionError("the plain prompt path must not call the chat template")
 
     monkeypatch.setattr(TinyTokenizer, "apply_chat_template", forbidden_chat)
     run_lagged_host_case(grad_tiny, tmp_path, monkeypatch, 2, 1.5, True, prompt_style="plain")

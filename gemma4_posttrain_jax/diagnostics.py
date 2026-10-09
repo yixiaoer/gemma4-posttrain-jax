@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -13,7 +14,7 @@ import numpy as np
 
 
 def checkpoint_storage(path: Path | None, *, mountinfo: str | None = None) -> dict[str, Any] | None:
-    """按实际挂载点识别内存文件系统；非内存文件系统也不代表已有持久备份。"""
+    """Detect a memory-backed filesystem from the mount point; a disk filesystem is not a durable backup either."""
     if path is None:
         return None
     resolved = path.resolve()
@@ -39,7 +40,7 @@ def checkpoint_storage(path: Path | None, *, mountinfo: str | None = None) -> di
 
 
 def optional_package_version(name: str) -> str | None:
-    """记录可选运行库；CPU环境没有libtpu时写null，不伪造TPU版本。"""
+    """Version of an optional package, or None when it is not installed (e.g. libtpu on CPU)."""
 
     try:
         return importlib.metadata.version(name)
@@ -48,7 +49,7 @@ def optional_package_version(name: str) -> str | None:
 
 
 def source_git_state(source_root: Path) -> tuple[str | None, str | None]:
-    """Git元数据可缺省；未提交目录或源码包仍由调用方记录实际源码SHA。"""
+    """Return the git commit and uncommitted diff, or (None, None) outside a git checkout."""
 
     try:
         root = subprocess.run(
@@ -59,7 +60,7 @@ def source_git_state(source_root: Path) -> tuple[str | None, str | None]:
             text=True,
             timeout=5,
         ).stdout.strip()
-        # 独立源码快照可能放在另一个仓库内，不能继承那个仓库的提交身份。
+        # A source copy nested in another repository must not report that repository's commit.
         if Path(root).resolve() != source_root.resolve():
             return None, None
         revision = subprocess.run(
@@ -71,6 +72,62 @@ def source_git_state(source_root: Path) -> tuple[str | None, str | None]:
         return revision, diff
     except (FileNotFoundError, subprocess.SubprocessError):
         return None, None
+
+
+def array_layout_manifest(tree: Any) -> list[dict[str, Any]]:
+    """List each array's shape, dtype and the chips holding its shards; only attributes are read, never the contents."""
+    records = []
+    for path, value in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        sharding = getattr(value, "sharding", None)
+        records.append(
+            {
+                "path": jax.tree_util.keystr(path),
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+                "sharding": None if sharding is None else str(sharding),
+                "addressable_shards": [
+                    {
+                        "device_id": int(shard.device.id),
+                        "process_index": int(shard.device.process_index),
+                        "index": repr(shard.index),
+                    }
+                    for shard in getattr(value, "addressable_shards", ())
+                ],
+            }
+        )
+    return records
+
+
+def execution_layout_record(
+    state: Any, rollout_params: Any, mesh: Any, *, rollout_backend: str, rollout_layout: str, logprob_backend: str
+) -> dict[str, Any]:
+    """Record the process and chips a run actually uses, and how training state and rollout weights are sharded.
+
+    Requested backends and the shardings observed on the arrays are kept apart, so it is visible
+    whether the configuration took effect.
+    """
+    devices = [
+        {
+            "id": int(device.id),
+            "process_index": int(device.process_index),
+            "platform": device.platform,
+            "device_kind": device.device_kind,
+            "coords": list(getattr(device, "coords", ())),
+        }
+        for device in mesh.devices.flat
+    ]
+    return {
+        "protocol": "actual-execution-layout-v1",
+        "pid": os.getpid(),
+        "process_index": jax.process_index(),
+        "process_count": jax.process_count(),
+        "mesh": {"axis_names": list(mesh.axis_names), "shape": dict(mesh.shape), "devices": devices},
+        "selected_backends": {"rollout": rollout_backend, "logprob": logprob_backend},
+        "requested_rollout_layout": rollout_layout,
+        "observation": "Only shard attributes were read; nothing was copied to the host and no device work was added.",
+        "training_state": array_layout_manifest(state),
+        "rollout_params": None if rollout_params is None else array_layout_manifest(rollout_params),
+    }
 
 
 def _masked_rows(actual: Any, expected: Any, mask: Any) -> tuple[np.ndarray, np.ndarray]:

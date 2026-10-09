@@ -1,4 +1,4 @@
-"""恢复比较必须发现RNG、缺失字段和浮点字节差异，而非只比较解码文本。"""
+"""Resume comparison must catch RNG, missing-field and floating-point byte differences, not just decoded text."""
 
 import importlib
 import json
@@ -29,7 +29,7 @@ def test_training_sampling_protocol_is_bound_to_supported_backend(monkeypatch, b
     if accepted:
         assert check(config) == protocol
     else:
-        with pytest.raises(ValueError, match="后端"):
+        with pytest.raises(ValueError, match="backend"):
             check(config)
 
 
@@ -46,7 +46,7 @@ def test_matching_candidate_arrays_cannot_claim_another_backend(tmp_path, monkey
     values.update(protocol=np.asarray("rollout-candidate-arrays-v1"), backend=np.asarray("jax"))
     path = tmp_path / "candidate.npz"
     np.savez(path, **values)
-    with pytest.raises(ValueError, match="候选后端"):
+    with pytest.raises(ValueError, match="candidate backend"):
         module.compare_candidate_files(path, path, expected_backend="inference-process")
 
 
@@ -92,7 +92,7 @@ def test_candidate_comparison_checks_all_saved_fields(tmp_path, monkeypatch, dif
     if difference is None:
         assert compare(left, right)["rows"] == 1
     else:
-        with pytest.raises(ValueError, match="候选"):
+        with pytest.raises(ValueError, match="candidate"):
             compare(left, right)
 
 
@@ -120,10 +120,7 @@ def test_evaluation_comparison_checks_model_and_complete_question_set(
 ):
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "scripts"))
     module = importlib.import_module("compare_recovery")
-    train_meta = {
-        "run_config": {"dataset_fingerprint": "dataset-v1"},
-        "source_files_sha256": {"gemma4_posttrain_jax/sampler.py": "sampler-v1"},
-    }
+    train_meta = {"run_config": {"dataset_fingerprint": "dataset-v1"}, "git_commit": "commit-v1"}
     rows = [
         dict(dataset_index=i, prompt_token_ids=[2, 3], completion_token_ids=[4, 1], length=2)
         for i in range(expected_count)
@@ -136,6 +133,8 @@ def test_evaluation_comparison_checks_model_and_complete_question_set(
     indices = [row["dataset_index"] for row in rows]
     (tmp_path / "baseline").mkdir()
     (tmp_path / "baseline/data_split.json").write_text(json.dumps({"training_indices": [100, 101]}))
+    (tmp_path / "baseline/meta.json").write_text(json.dumps(train_meta))
+    (tmp_path / "baseline/source.diff").write_text("")
     for run in ("baseline", "resume"):
         folder = tmp_path / f"eval-{run}"
         (folder / "evaluation").mkdir(parents=True)
@@ -146,17 +145,17 @@ def test_evaluation_comparison_checks_model_and_complete_question_set(
             subset="train-dev",
             checkpoint_metadata=dict(run_config=train_meta["run_config"], data_cursor=17),
             dataset_fingerprint="dataset-v1",
-            indices_sha256=module.indices_sha256(indices),
             prediction_record_schema="raw-token-ids-v1",
             sampling_math_protocol="fp32-exp-log-highest-v1",
-            source_files_sha256=dict(train_meta["source_files_sha256"]),
+            git_commit=train_meta["git_commit"],
             sampler=dict(temperature=0),
             jax_default_matmul_precision="highest",
         )
-        if corruption == "indices":
-            meta["indices_sha256"] = module.indices_sha256([4, 5, 6, 7])
+        selected = [4, 5, 6, 7] if corruption == "indices" else indices
+        (folder / "data_selection.json").write_text(json.dumps({"indices": selected}))
+        (folder / "source.diff").write_text("")
         if corruption == "source":
-            meta["source_files_sha256"]["gemma4_posttrain_jax/sampler.py"] = "another-sampler"
+            meta["git_commit"] = "another-commit"
         if corruption == "sampler" and run == "resume":
             meta["sampler"]["temperature"] = 1
         if corruption == "both-nongreedy":
@@ -181,7 +180,7 @@ def test_evaluation_comparison_checks_model_and_complete_question_set(
             == rows
         )
     else:
-        with pytest.raises(ValueError, match="评估"):
+        with pytest.raises(ValueError, match="evaluation"):
             module.check_evaluation_records(
                 tmp_path, train_meta, 17, expected_count=expected_count, expected_max_new_tokens=expected_length
             )

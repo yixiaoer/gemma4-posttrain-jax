@@ -1,6 +1,6 @@
 # QuickStart
 
-这篇文档从安装开始，依次介绍文本生成、SFT、GRPO、保存和继续训练，以及测试与验证范围。所有命令都在仓库根目录运行。训练示例使用 Gemma 4 E2B 和四个 TPU v4 JAX 设备。
+这篇文档从安装开始，依次介绍文本生成、SFT、GRPO、保存和继续训练、完整的 GRPO 实验，以及测试与验证范围。所有命令都在仓库根目录运行。训练示例使用 Gemma 4 E2B 和四个 TPU v4 JAX 设备。
 
 ## 1. 搭环境
 
@@ -139,7 +139,20 @@ new-grpo/
 
 ---
 
-## 5. 单独评估
+## 5. 完整的 GRPO 实验
+
+上面的恢复示例只训练 4 步，用来逐个比较数组。想看一次完整的训练，可以运行标准实验：在 GSM8K 上训练 200 步，第 100 步换新进程续训，最后单独加载训练结果评估，并自动检查续训是否与连续训练一致。
+
+```bash
+WANDB_PROJECT=gemma4_posttrain_jax \
+  bash examples/e2b_grpo_gsm8k.sh /path/to/e2b-snapshot /path/to/new-run /path/to/checkpoints
+```
+
+正式运行需要一个多小时，建议先用 `MAX_STEPS=4 RESUME_STEP=2 EVAL_EVERY=2 EVAL_SIZE=8` 试一遍。实验配置、每个阶段做什么、怎样读比较结果和 W&B 曲线，见[示例说明](../examples/e2b_grpo_gsm8k.md)。
+
+---
+
+## 6. 单独评估
 
 例如评估 GRPO 第 4 步：
 
@@ -153,9 +166,11 @@ new-grpo/
 
 输出包含逐题回答、标准答案、评分、生成长度和 token ID。也支持初始模型和 MATH 数据，详见 `--help`。
 
+加上 `--audit-loaded-state`，评估前会把加载到的参数和 Adam 状态完整读一遍，为每个数组记下校验值，写入 `loaded_state_audit.json`，用来和训练结束时的记录对照，确认存档被完整读回。完整读一遍要花一些时间，所以默认不开。
+
 ---
 
-## 6. 测试与验证范围
+## 7. 测试与验证范围
 
 安装 `.[hf,dev]` 后，可以在 CPU 上运行核心测试：
 
@@ -171,6 +186,13 @@ JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=2 \
   .venv/bin/python -m pytest tests/test_inference_rng.py
 ```
 
+滞后生成和候选批次记录的 CPU 用例按单个设备编写，在四个虚拟设备下会自动跳过，需要不设置 `XLA_FLAGS` 单独运行：
+
+```bash
+JAX_PLATFORMS=cpu .venv/bin/python -m pytest -m 'not tpu' \
+  tests/test_stale_rollout.py tests/test_rollout_batch_audit.py
+```
+
 本批迁移后的 ICI、BF16 内容与分块保存已在真实四芯 TPU v4 上通过 59 项数组检查。它们覆盖传输内容、浮点转换、分片方向、保存字节和失败条件，不加载 E2B。运行相同检查：
 
 ```bash
@@ -178,4 +200,4 @@ JAX_PLATFORMS=tpu,cpu .venv/bin/python -m pytest \
   tests/test_inference_device.py tests/test_checkpoint_chunks.py
 ```
 
-完整 E2B 训练、保存与独立续训应另外运行前面的恢复示例。已有历史实验不自动覆盖迁移后的代码，尤其非零 KL 的训练需要按当前数学实现重新验证。
+完整 E2B 训练、保存与独立续训应另外运行前面的恢复示例或完整实验。已有历史实验不自动覆盖迁移后的代码，尤其非零 KL 的训练需要按当前数学实现重新验证。

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""固定 GSM8K/MATH 留出集，对初始 HF 或完整训练 checkpoint 做 greedy 评估。"""
+"""Greedy evaluation of the initial HF model or a full training checkpoint on a fixed GSM8K/MATH subset."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import multiprocessing
 import time
@@ -24,7 +23,6 @@ from gemma4_posttrain_jax.checkpoint import load_train_state, read_checkpoint_me
 from gemma4_posttrain_jax.diagnostics import optional_package_version, source_git_state
 from gemma4_posttrain_jax.evaluation import (
     evaluate_batches,
-    indices_sha256,
     load_evaluation_data,
     make_eval_sampler,
     prepare_eval_batches,
@@ -49,10 +47,28 @@ from gemma4_posttrain_jax.tracking import compile_tracking_metrics, grpo_trackin
 from gemma4_posttrain_jax.weights import load_hf_eos_token_ids, load_hf_params
 
 
+def record_loaded_state(state: TrainState[Any], output: Path) -> None:
+    """Read the whole loaded parameter and Adam state and record a checksum per array.
+
+    The record is compared with the one written at the end of training.
+    """
+    from gemma4_posttrain_jax.state_audit import summarize_train_state
+
+    record = summarize_train_state(state)
+    write_json(output, record)
+    if not record["all_finite"]:
+        raise ValueError("the loaded state contains non-finite values; the full record was saved")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", type=Path)
     parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument(
+        "--audit-loaded-state",
+        action="store_true",
+        help="before evaluating, read the whole loaded parameter and Adam state and record a checksum per array (slow)",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--size", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -60,8 +76,14 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dataset", choices=("gsm8k", "math"), default="gsm8k")
-    parser.add_argument("--prompt-style", choices=("chat", "plain"), help="省略时继承checkpoint，初始HF默认chat")
-    parser.add_argument("--rollout-layout", choices=("replicated", "fsdp"), help="省略时继承checkpoint的采样布局")
+    parser.add_argument(
+        "--prompt-style",
+        choices=("chat", "plain"),
+        help="inherited from the checkpoint when omitted; chat for the initial HF model",
+    )
+    parser.add_argument(
+        "--rollout-layout", choices=("replicated", "fsdp"), help="inherited from the checkpoint when omitted"
+    )
     parser.add_argument("--subset", choices=("test-monitor", "train-dev", "test-unused", "math500"))
     parser.add_argument("--dev-size", type=int, default=500)
     parser.add_argument("--dev-seed", type=int, default=0)
@@ -70,11 +92,15 @@ def main() -> None:
     parser.add_argument("--wandb-project", default="gemma4_posttrain_jax")
     parser.add_argument("--wandb-run-name")
     parser.add_argument("--wandb-tags", nargs="*", default=())
+    parser.add_argument("--wandb-group", help="W&B group shared with the corresponding training runs")
+    parser.add_argument("--wandb-job-type", help="W&B job type, e.g. evaluate")
     args = parser.parse_args()
+    if args.audit_loaded_state and args.checkpoint is None:
+        raise ValueError("--audit-loaded-state requires --checkpoint")
     if args.max_prompt_len is None:
         args.max_prompt_len = 2048 if args.dataset == "math" else 512
     if min(args.batch_size, args.max_prompt_len, args.max_new_tokens, args.reward_workers) <= 0:
-        raise ValueError("评估 batch/长度/workers 必须为正")
+        raise ValueError("evaluation batch size, lengths and workers must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=False)
     checkpoint_meta = None if args.checkpoint is None else read_checkpoint_metadata(args.checkpoint)["metadata"]
     args.prompt_style = resolve_eval_prompt_style(
@@ -89,10 +115,10 @@ def main() -> None:
         else:
             snapshots = sorted(Path.home().glob(".cache/huggingface/hub/models--google--gemma-4-E2B-it/snapshots/*"))
             if len(snapshots) != 1:
-                raise ValueError("需要明确 --model-path")
+                raise ValueError("--model-path is required")
             args.model_path = snapshots[0]
     if checkpoint_meta is not None and str(args.model_path.resolve()) != checkpoint_meta["run_config"]["model_path"]:
-        raise ValueError("评估 config/tokenizer 必须与 checkpoint 的 HF snapshot 一致")
+        raise ValueError("the evaluation config/tokenizer must come from the checkpoint's HF snapshot")
     lora_config = checkpoint_lora_config(
         None if checkpoint_meta is None else checkpoint_meta["run_config"], args.model_path
     )
@@ -124,14 +150,15 @@ def main() -> None:
             "dev_seed": args.dev_seed if args.subset == "train-dev" else None,
             "indices": indices,
             "prompt_style": args.prompt_style,
-            "indices_sha256": indices_sha256(indices),
             "source_ids": [dataset[index].get("source_id") for index in indices],
         },
     )
     host, config = load_hf_params(str(args.model_path), dtype=jnp.float32 if lora_config is None else jnp.bfloat16)
     mesh = make_mesh()
     if args.batch_size <= 0 or args.batch_size % mesh.size or args.max_new_tokens <= 0 or args.reward_workers <= 0:
-        raise ValueError("评估长度/workers 必须为正，batch 必须能被设备数整除")
+        raise ValueError(
+            "evaluation lengths and workers must be positive, and the batch size must be divisible by the device count"
+        )
     master = shard_gemma4_text_params(host, config, mesh)
     del host
     step = 0
@@ -144,7 +171,8 @@ def main() -> None:
             learning_rate=checkpoint_meta["run_config"]["learning_rate"],
             freeze_embeddings=checkpoint_meta["run_config"]["freeze_embeddings"],
         )
-        # 从参数布局推导完整状态布局，再释放初始化权重；优化器只读取后即释放。
+        # Derive the full state layout from the parameter layout, then free the initial weights;
+        # the optimizer is only needed for that layout.
         layout_state = replicate_scalars(init_train_state(master, optimizer), mesh)
         template = jax.eval_shape(lambda current: current, layout_state)
         layouts = tree_shardings(layout_state)
@@ -155,6 +183,8 @@ def main() -> None:
             del restored
         else:
             state = load_train_state(args.checkpoint, template, shardings=layouts)
+        if args.audit_loaded_state:
+            record_loaded_state(state, args.output_dir / "loaded_state_audit.json")
         master, step = state.params_f32, int(state.step)
         del state
     rollout_params: Any
@@ -173,6 +203,8 @@ def main() -> None:
         layouts = tree_shardings(layout_state)
         del layout_state, adapters
         state = load_train_state(args.checkpoint, template, shardings=layouts)
+        if args.audit_loaded_state:
+            record_loaded_state(state, args.output_dir / "loaded_state_audit.json")
         rollout_params, step = LoRAPolicyParams(master, state.params_f32), int(state.step)
         del state
     jax.block_until_ready(rollout_params)
@@ -217,11 +249,7 @@ def main() -> None:
         args.output_dir / "meta.json",
         {
             "git_commit": revision,
-            "source_diff_sha256": None if diff is None else hashlib.sha256(diff.encode()).hexdigest(),
-            "source_files_sha256": {
-                str(path.relative_to(source_root)): hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in [*sorted((source_root / "gemma4_posttrain_jax").rglob("*.py")), Path(__file__).resolve()]
-            },
+            "uncommitted_changes": None if diff is None else bool(diff),
             "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
             "checkpoint_metadata": checkpoint_meta,
             "step": step,
@@ -229,7 +257,6 @@ def main() -> None:
             "subset": args.subset,
             "dataset_fingerprint": dataset._fingerprint,
             "data_provenance": provenance,
-            "indices_sha256": indices_sha256(indices),
             "sampler": sampler_config._asdict(),
             "sampling_math_protocol": "fp32-exp-log-highest-v1",
             "prediction_record_schema": "raw-token-ids-v1",
@@ -245,6 +272,8 @@ def main() -> None:
             run_name=args.wandb_run_name,
             tags=args.wandb_tags,
             config={"logging_mode": "live", "source_metadata": json.loads((args.output_dir / "meta.json").read_text())},
+            group=args.wandb_group,
+            job_type=args.wandb_job_type,
         )
         stack.callback(tracker.finish)
         start = time.perf_counter()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gemma 4 E2B 的同步 GRPO族多轮更新：真实 GSM8K rollout、奖励、更新与恢复。"""
+"""Synchronous GRPO-family training for Gemma 4 E2B: GSM8K rollouts, rewards, updates and resume."""
 
 from __future__ import annotations
 
@@ -44,6 +44,7 @@ from gemma4_posttrain_jax.data import (
 )
 from gemma4_posttrain_jax.diagnostics import (
     checkpoint_storage,
+    execution_layout_record,
     logprob_drift_gate,
     logprob_drift_metrics,
     optional_package_version,
@@ -86,21 +87,21 @@ TIMING_PROTOCOL = "rl-iteration-stages-v3"
 def iteration_device_allocation(
     backend: str, training_ids: list[int], inference_ids: list[int] | None
 ) -> dict[str, int]:
-    """完整迭代按实际占用计费；独立运行时的相同编号不表示同一颗芯片。"""
+    """Charge a full iteration by the devices it occupies; the same index in a separate runtime is not the same chip."""
     if not training_ids or len(set(training_ids)) != len(training_ids):
-        raise ValueError("训练设备必须非空且不重复")
+        raise ValueError("training devices must be non-empty and unique")
     if backend == "jax":
         if inference_ids:
-            raise ValueError("原生同步采样复用训练设备，不分配独立推理设备")
+            raise ValueError("native synchronous rollout reuses the training devices; do not assign inference devices")
         separate = 0
     elif backend in ("inference", "inference-process", "inference-distributed"):
         if not inference_ids or len(set(inference_ids)) != len(inference_ids):
-            raise ValueError("独立推理设备必须非空且不重复")
+            raise ValueError("inference devices must be non-empty and unique")
         if backend != "inference-process" and set(training_ids) & set(inference_ids):
-            raise ValueError("同一运行时的训练和推理设备不能重叠")
+            raise ValueError("training and inference devices in the same runtime must not overlap")
         separate = len(inference_ids)
     else:
-        raise ValueError(f"未知 rollout backend: {backend}")
+        raise ValueError(f"unknown rollout backend: {backend}")
     return {
         "training_devices": len(training_ids),
         "separate_inference_devices": separate,
@@ -113,98 +114,134 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=Path)
     parser.add_argument("--dataset", choices=("gsm8k", "math"), default="gsm8k")
     parser.add_argument(
-        "--prompt-style", choices=("chat", "plain"), default="chat", help="base模型使用plain；恢复必须保持模板"
+        "--prompt-style",
+        choices=("chat", "plain"),
+        default="chat",
+        help="use plain for base models; a resumed run must keep the same template",
     )
-    parser.add_argument("--output-dir", type=Path, required=True, help="新的运行目录，不覆盖历史产物")
+    parser.add_argument(
+        "--output-dir", type=Path, required=True, help="new run directory; existing outputs are never overwritten"
+    )
     parser.add_argument("--rollout-layout", choices=("replicated", "fsdp"), default="replicated")
     parser.add_argument(
         "--rollout-backend", choices=("jax", "inference", "inference-process", "inference-distributed"), default="jax"
     )
-    parser.add_argument("--training-device-ids", type=int, nargs="+", help="显式训练mesh设备ID；省略保持全部设备")
+    parser.add_argument(
+        "--training-device-ids", type=int, nargs="+", help="explicit training mesh device IDs; all devices when omitted"
+    )
     parser.add_argument(
         "--inference-device-ids",
         type=int,
         nargs="+",
-        help="同进程默认2、3；独立运行时固定本地0、1；共同运行时按推理进程自动选择全局ID",
+        help="same process: 2 3 by default; separate runtime: local 0 1; shared runtime: chosen by the engine",
     )
-    parser.add_argument("--inference-python", type=Path, help="独立进程使用的固定推理环境解释器")
+    parser.add_argument(
+        "--inference-python",
+        type=Path,
+        help="interpreter of the pinned inference environment used by the separate process",
+    )
     parser.add_argument(
         "--inference-weight-transport",
         choices=("auto", "host", "device"),
         default="auto",
-        help="auto 默认：inference/inference-distributed 使用 ICI；独立运行时 inference-process 使用 host",
+        help="auto (default): ICI for inference and inference-distributed, host transfer for inference-process",
     )
     parser.add_argument("--inference-memory-fraction", type=float, default=0.5)
     parser.add_argument(
         "--inference-source-read-mode",
         choices=("direct", "transient_copy"),
         default="direct",
-        help="独立推理进程权重同步时读取训练参数的主机副本策略",
+        help="how training prepares the host copy of parameters for a separate inference process",
     )
     parser.add_argument(
         "--trim-training-host-allocator-after-transfer",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="独立推理进程收到全部参数后，请求训练进程归还空闲主机页",
+        help="after a separate inference process receives the weights, return free host pages on the training side",
     )
     parser.add_argument(
         "--trim-inference-host-allocator-after-update",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="独立推理进程完成参数更新后，请求推理进程归还空闲主机页",
+        help="after the separate inference process applies an update, ask it to return free host pages",
     )
-    parser.add_argument("--lora-rank", type=int, help="只训练独立FP32 attention适配器；首个入口需要FSDP/β0/lag0")
-    parser.add_argument("--lora-alpha", type=float, help="默认2*rank，训练和保存使用未缩放A/B")
+    parser.add_argument(
+        "--lora-rank",
+        type=int,
+        help="train only separate FP32 attention adapters; currently requires FSDP, beta 0 and lag 0",
+    )
+    parser.add_argument(
+        "--lora-alpha", type=float, help="defaults to 2*rank; training and checkpoints keep the unscaled A/B"
+    )
     parser.add_argument("--lora-targets", nargs="+", choices=("q_proj", "k_proj", "v_proj", "o_proj"))
-    parser.add_argument("--prompt-batch-size", type=int, default=8, help="不同题目数；实际生成行数为此值乘 G")
+    parser.add_argument(
+        "--prompt-batch-size",
+        type=int,
+        default=8,
+        help="number of distinct questions; generated rows are this value times G",
+    )
     parser.add_argument("--group-size", type=int, default=4)
     parser.add_argument(
         "--algorithm",
         choices=("grpo", "drgrpo", "dapo", "dapo-loss", "gspo-token", "rloo"),
         default="grpo",
-        help="dapo默认启用动态补采/超长过滤/软长度惩罚；dapo-loss只选择目标",
+        help="dapo also turns on dynamic sampling, overlong filtering and length penalty; dapo-loss does not",
     )
-    parser.add_argument("--updates-per-rollout", type=int, default=1, help="同一完整rollout batch执行μ次Adam更新")
+    parser.add_argument(
+        "--updates-per-rollout", type=int, default=1, help="number of Adam updates (mu) on one complete rollout batch"
+    )
     parser.add_argument(
         "--loss-aggregation",
         choices=("sequence-mean-token-mean", "token-mean", "sequence-mean-token-scale", "seq-mean-token-sum"),
-        help="显式聚合消融；覆盖算法默认值",
+        help="explicit loss aggregation; overrides the algorithm default",
     )
-    parser.add_argument("--token-scale", type=float, help="常数尺度聚合的分母；省略时使用生成预算N")
-    parser.add_argument("--sampler-is-cap", type=float, help="冻结old-trainer/behavior逐token修正的上限")
+    parser.add_argument(
+        "--token-scale",
+        type=float,
+        help="denominator of the constant-scale aggregation; defaults to the generation budget N",
+    )
+    parser.add_argument(
+        "--sampler-is-cap", type=float, help="cap on the frozen per-token old-trainer/behavior correction"
+    )
     parser.add_argument(
         "--rollout-lag-updates",
         type=int,
         choices=(0, 1),
         default=0,
-        help="1: 顺序执行的一次Adam权重滞后对照；不表示训练与生成并行",
+        help="1: sample with weights one Adam update behind, run sequentially; training and generation do not overlap",
     )
     parser.add_argument(
         "--filter-truncated-loss",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="超长行不参与loss，保留生成上下文和原始奖励",
+        help="exclude overlong rows from the loss while keeping their context and raw reward",
     )
     parser.add_argument("--dynamic-sampling", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--max-sampling-attempts", type=int, default=16, help="补足一个有效batch的最大候选batch次数")
+    parser.add_argument(
+        "--max-sampling-attempts", type=int, default=16, help="maximum candidate batches drawn to fill one valid batch"
+    )
     parser.add_argument("--overlong-buffer-length", type=int, default=None)
     parser.add_argument("--overlong-penalty", type=float, default=None)
     parser.add_argument("--max-prompt-len", type=int, default=512)
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--microbatch-size", type=int, help="训练/参考前向的展开行数；完整 rollout 后累积一次更新")
-    parser.add_argument("--max-steps", type=int, default=30, help="目标全局更新步数")
+    parser.add_argument(
+        "--microbatch-size",
+        type=int,
+        help="rows per training/reference forward; gradients accumulate into one update per rollout",
+    )
+    parser.add_argument("--max-steps", type=int, default=30, help="target global update step")
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--beta", type=float, default=0.0)
     parser.add_argument(
         "--kl-clamp-value",
         type=float,
-        help="可选的逐 token KL 上限；启用后会改变目标和超过上限时的梯度",
+        help="optional per-token KL cap; enabling it changes the objective and the gradient above the cap",
     )
     parser.add_argument(
         "--truncated-reward",
         choices=("keep", "zero"),
         default="keep",
-        help="zero: 达长度上限但未 EOS 的行使用零训练奖励，保留原始评分",
+        help="zero: rows that hit the length limit without EOS get zero training reward; the raw score is kept",
     )
     parser.add_argument("--format-bonus", type=float, default=0.1)
     parser.add_argument("--freeze-embeddings", action="store_true")
@@ -215,36 +252,66 @@ def parse_args() -> argparse.Namespace:
         "--logprob-backend",
         choices=("jax", "pallas"),
         default="jax",
-        help="logprob 后端；pallas 为四芯片 TPU v4/BF16 实验选项，长期 GRPO 数值差异尚未解决",
+        help="logprob backend; pallas is experimental (four TPU v4 chips, BF16, unresolved long-run differences)",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--reward-workers", type=int, default=4)
     parser.add_argument("--save-every", type=int, default=0)
     parser.add_argument(
-        "--save-at-steps", type=int, nargs="+", help="只在指定完整rollout更新边界保存；与save-every互斥"
+        "--save-at-steps",
+        type=int,
+        nargs="+",
+        help="save only at these update steps (complete rollout boundaries); mutually exclusive with --save-every",
     )
     parser.add_argument(
-        "--audit-final-state", action="store_true", help="记录最终模型参数和 Adam 状态的校验值，用于检查恢复结果"
+        "--audit-final-state",
+        action="store_true",
+        help="record a checksum of every final parameter and Adam array for resume checks",
     )
-    parser.add_argument("--audit-update-state", action="store_true", help="每步记录少量可训练参数的真实变化")
     parser.add_argument(
-        "--audit-rollout-batches", action="store_true", help="保留全部候选batch的原始token/logprob/掩码和随机key"
+        "--audit-execution-layout",
+        action="store_true",
+        help="record the processes, chips and shardings of training state and rollout weights before the first rollout",
+    )
+    parser.add_argument(
+        "--audit-update-state",
+        action="store_true",
+        help="record the actual change of a few trainable arrays at every step",
+    )
+    parser.add_argument(
+        "--audit-rollout-batches",
+        action="store_true",
+        help="keep the raw tokens, logprobs, masks and random keys of every candidate batch",
     )
     parser.add_argument("--checkpoint-dir", type=Path)
     parser.add_argument("--resume", type=Path)
-    parser.add_argument("--save-hlo", action="store_true", help="保存各 JIT 边界的 StableHLO、优化 HLO 和内存分析")
-    parser.add_argument("--eval-every", type=int, default=0, help="0 关闭；否则在起始步和每 N 个更新后评估")
+    parser.add_argument(
+        "--save-hlo",
+        action="store_true",
+        help="save StableHLO, optimized HLO and memory analysis for each JIT boundary",
+    )
+    parser.add_argument(
+        "--eval-every", type=int, default=0, help="0 disables; otherwise evaluate at the start step and every N updates"
+    )
     parser.add_argument("--eval-size", type=int, default=500)
     parser.add_argument("--eval-batch-size", type=int, default=32)
     parser.add_argument("--eval-max-new-tokens", type=int, default=1024)
     parser.add_argument("--eval-seed", type=int, default=0)
-    parser.add_argument("--dev-size", type=int, default=0, help="从所选训练数据中排除并固定保留的dev题数")
+    parser.add_argument(
+        "--dev-size", type=int, default=0, help="number of dev questions held out from the training data"
+    )
     parser.add_argument("--dev-seed", type=int, default=0)
     parser.add_argument("--eval-split", choices=("test", "train-dev"), default="test")
-    parser.add_argument("--wandb", action="store_true", help="启用 host 侧 W&B；离线设 WANDB_MODE=offline")
+    parser.add_argument(
+        "--wandb", action="store_true", help="log to W&B from the host; set WANDB_MODE=offline to log offline"
+    )
     parser.add_argument("--wandb-project", default="gemma4_posttrain_jax")
     parser.add_argument("--wandb-run-name")
     parser.add_argument("--wandb-tags", nargs="*", default=())
+    parser.add_argument(
+        "--wandb-group", help="W&B group shared by the continuous run, resumed run and evaluation of one experiment"
+    )
+    parser.add_argument("--wandb-job-type", help="W&B job type within the group, e.g. train or resume")
     from gemma4_posttrain_jax.inference_runtime import resolve_weight_sync_transport
 
     args = parser.parse_args()
@@ -323,15 +390,15 @@ def compile_call(name: str, fn: Any, arguments: tuple[Any, ...], output_dir: Pat
 
 
 def validate_resume_config(saved: Any, current: dict[str, Any]) -> None:
-    """检查续训配置，仅补齐旧版中不改变训练行为的默认记录字段。"""
+    """Check a resume configuration, filling in only old default fields that do not change training behavior."""
     if not isinstance(saved, dict):
-        raise ValueError("checkpoint 缺少有效的训练配置")
+        raise ValueError("checkpoint has no valid training configuration")
     restored = dict(saved)
     if "kl_estimator" not in restored:
         if restored.get("beta") != 0:
             raise ValueError(
-                "旧 checkpoint 使用未标注版本的 KL 公式，不能按新 K3 实现精确续训；"
-                "请使用保存该 checkpoint 的代码继续原实验"
+                "the old checkpoint uses an unversioned KL formula and cannot be resumed exactly with the new K3 "
+                "implementation; continue the original experiment with the code that saved it"
             )
         restored["kl_estimator"] = "none"
     restored.setdefault("kl_clamp_value", None)
@@ -342,7 +409,7 @@ def validate_resume_config(saved: Any, current: dict[str, Any]) -> None:
             for name in restored.keys() | current.keys()
             if restored.get(name, missing) != current.get(name, missing)
         )
-        raise ValueError(f"恢复配置与 checkpoint 不一致：{', '.join(changed)}")
+        raise ValueError(f"resume configuration differs from the checkpoint: {', '.join(changed)}")
 
 
 def main() -> None:
@@ -356,22 +423,26 @@ def main() -> None:
         or args.trim_inference_host_allocator_after_update
     )
     if memory_controls_enabled and not process_inference:
-        raise ValueError("权重同步主机内存控制只用于独立推理进程后端")
+        raise ValueError("host-memory controls for weight sync apply only to the separate inference-process backend")
     if args.trim_training_host_allocator_after_transfer and args.inference_source_read_mode != "transient_copy":
-        raise ValueError("训练侧分配器回收只允许与transient_copy一起启用")
+        raise ValueError("training-side allocator release requires transient_copy")
     if args.rollout_backend != "jax":
         if args.lora_rank is not None or args.rollout_lag_updates or args.eval_every:
-            raise ValueError("首个引擎闭环不支持LoRA、滞后或进程内周期评估；独立评估可读完整训练状态")
+            raise ValueError(
+                "the engine loop does not support LoRA, lag or periodic evaluation; evaluate checkpoints separately"
+            )
         if args.sampler_is_cap is None:
-            raise ValueError("引擎闭环需要显式sampler-is-cap，记录trainer/behavior分布修正")
+            raise ValueError(
+                "the engine loop requires an explicit --sampler-is-cap for the trainer/behavior correction"
+            )
         if not 0 < args.inference_memory_fraction < 1:
-            raise ValueError("推理内存比例必须在0和1之间")
+            raise ValueError("inference memory fraction must be between 0 and 1")
         if distributed_inference:
             from gemma4_posttrain_jax.inference_shared import shared_devices
 
             ordered_devices = shared_devices(0)
             if not os.environ.get("GEMMA4_SHARED_ICI_SOCKET") or not os.environ.get("GEMMA4_SHARED_ICI_NONCE"):
-                raise ValueError("共同运行时需要启动器创建的本机控制连接")
+                raise ValueError("the shared runtime needs the local control connection created by its launcher")
             if args.training_device_ids is None:
                 args.training_device_ids = [int(d.id) for d in ordered_devices[:2]]
             if args.inference_device_ids is None:
@@ -379,7 +450,9 @@ def main() -> None:
             if args.training_device_ids != [int(d.id) for d in ordered_devices[:2]] or args.inference_device_ids != [
                 int(d.id) for d in ordered_devices[2:]
             ]:
-                raise ValueError("共同运行时固定 rank0 训练、rank1 推理，各持有两芯")
+                raise ValueError(
+                    "the shared runtime uses rank 0 for training and rank 1 for inference, with two chips each"
+                )
         if args.training_device_ids is None:
             args.training_device_ids = [0, 1]
         if args.inference_device_ids is None:
@@ -388,13 +461,17 @@ def main() -> None:
             from gemma4_posttrain_jax.inference_remote import inspect_engine_environment
 
             if os.environ.get("TPU_VISIBLE_CHIPS") != "0,1" or args.training_device_ids != [0, 1]:
-                raise ValueError("独立进程模式要求启动前绑定训练物理chips0,1，并使用本地devices0,1")
+                raise ValueError(
+                    "separate-process mode requires training bound to physical chips 0,1 and using local devices 0,1"
+                )
             if args.inference_device_ids != [0, 1] or args.inference_python is None or args.beta:
-                raise ValueError("独立进程首版固定引擎本地devices0,1、β0，并显式指定inference-python")
+                raise ValueError(
+                    "separate-process mode uses engine devices 0,1 and beta 0, and requires --inference-python"
+                )
             inference_identity = inspect_engine_environment(args.inference_python)
         elif args.inference_python is not None:
-            raise ValueError("inference-python仅用于独立进程模式")
-        # 引擎方法使用独立DEFAULT上下文，训练仍按原HIGHEST精度编译。
+            raise ValueError("--inference-python applies only to separate-process mode")
+        # Engine calls use their own DEFAULT precision context; training still compiles at HIGHEST.
         jax.config.update("jax_default_matmul_precision", "highest")
     elif (
         args.inference_device_ids is not None
@@ -402,7 +479,7 @@ def main() -> None:
         or args.inference_python is not None
         or memory_controls_enabled
     ):
-        raise ValueError("推理设备和内存参数仅用于inference后端")
+        raise ValueError("inference device and memory options apply only to the inference backends")
     lora_config = None
     if args.lora_rank is not None:
         lora_config = LoRAConfig(
@@ -412,16 +489,20 @@ def main() -> None:
         )
         check_lora_config(lora_config)
         if args.beta or args.rollout_lag_updates or args.rollout_layout != "fsdp":
-            raise ValueError("首个LoRA入口固定β0/lag0和FSDP基础权重；其它组合尚未验收")
+            raise ValueError(
+                "LoRA currently requires beta 0, lag 0 and FSDP base weights; other combinations are not validated"
+            )
         args.freeze_embeddings = True
     elif args.lora_alpha is not None or args.lora_targets is not None:
-        raise ValueError("lora-alpha/targets需要显式lora-rank")
+        raise ValueError("--lora-alpha and --lora-targets require --lora-rank")
     if args.dataset == "math" and args.eval_every and args.eval_split != "train-dev":
-        raise ValueError("MATH周期评估使用train-dev；MATH500保留给独立最终评估")
+        raise ValueError(
+            "periodic MATH evaluation uses train-dev; MATH500 is reserved for the separate final evaluation"
+        )
     if min(args.prompt_batch_size, args.max_prompt_len, args.max_new_tokens, args.max_steps, args.reward_workers) <= 0:
-        raise ValueError("batch、长度、步数和 reward workers 必须为正")
+        raise ValueError("batch sizes, lengths, steps and reward workers must be positive")
     if args.group_size < 2 or args.beta < 0 or args.save_every < 0 or args.eval_every < 0:
-        raise ValueError("需要 G >= 2、beta >= 0、save-every/eval-every >= 0")
+        raise ValueError("requires G >= 2, beta >= 0 and save-every/eval-every >= 0")
     validate_update_schedule(
         updates_per_rollout=args.updates_per_rollout,
         max_steps=args.max_steps,
@@ -430,18 +511,20 @@ def main() -> None:
     )
     if args.save_at_steps is not None:
         if args.save_every or len(set(args.save_at_steps)) != len(args.save_at_steps):
-            raise ValueError("save-at-steps不能与save-every并用，且不允许重复步")
+            raise ValueError("--save-at-steps cannot be combined with --save-every or repeat a step")
         if any(step <= 0 or step > args.max_steps or step % args.updates_per_rollout for step in args.save_at_steps):
-            raise ValueError("save-at-steps必须为预算内完整rollout的正更新步")
+            raise ValueError(
+                "--save-at-steps must be positive update steps at complete rollout boundaries within the budget"
+            )
     if args.sampler_is_cap is not None and (not np.isfinite(args.sampler_is_cap) or args.sampler_is_cap <= 0):
-        raise ValueError("sampler-is-cap必须为正的有限数")
+        raise ValueError("--sampler-is-cap must be a positive finite number")
     if args.kl_clamp_value is not None and (
         not np.isfinite(args.kl_clamp_value)
         or args.kl_clamp_value <= 0
         or args.kl_clamp_value > float(np.finfo(np.float32).max)
         or not args.beta
     ):
-        raise ValueError("kl-clamp-value必须是FP32可表示的正有限数，并且只能在beta大于零时启用")
+        raise ValueError("--kl-clamp-value must be a positive finite FP32 value and requires beta > 0")
     if args.dynamic_sampling is None:
         args.dynamic_sampling = args.algorithm == "dapo"
     if args.filter_truncated_loss is None:
@@ -451,13 +534,15 @@ def main() -> None:
     if args.overlong_penalty is None:
         args.overlong_penalty = 1.0 if args.algorithm == "dapo" else 0.0
     if args.max_sampling_attempts <= 0 or not 0 <= args.overlong_buffer_length <= args.max_new_tokens:
-        raise ValueError("sampling attempts必须为正，overlong buffer须在[0,N]内")
+        raise ValueError("sampling attempts must be positive and the overlong buffer must be within [0, N]")
     if (
         not np.isfinite(args.overlong_penalty)
         or args.overlong_penalty < 0
         or (args.overlong_penalty and not args.overlong_buffer_length)
     ):
-        raise ValueError("overlong penalty必须非负有限，启用时buffer必须为正")
+        raise ValueError(
+            "the overlong penalty must be finite and non-negative, and needs a positive buffer when enabled"
+        )
     if args.algorithm == "rloo" and (
         args.updates_per_rollout != 1
         or args.beta
@@ -466,30 +551,32 @@ def main() -> None:
         or args.dynamic_sampling
         or args.filter_truncated_loss
     ):
-        raise ValueError("首个RLOO入口固定μ1、β0、无IS/滞后/动态过滤；其他组合需要单独定义")
+        raise ValueError("RLOO currently requires mu 1, beta 0 and no IS, lag or dynamic filtering")
     objective = objective_for_algorithm(
         "dapo" if args.algorithm == "dapo-loss" else args.algorithm, generation_budget=args.max_new_tokens
     )
     if args.loss_aggregation is not None:
         objective = objective._replace(agg_mode=args.loss_aggregation)
     if args.token_scale is not None and (not np.isfinite(args.token_scale) or args.token_scale <= 0):
-        raise ValueError("token-scale必须为正的有限数")
+        raise ValueError("--token-scale must be a positive finite number")
     if objective.agg_mode == "sequence-mean-token-scale":
         objective = objective._replace(token_scale=args.token_scale or float(args.max_new_tokens))
     elif args.token_scale is not None:
-        raise ValueError("token-scale只用于sequence-mean-token-scale聚合")
+        raise ValueError("--token-scale applies only to sequence-mean-token-scale aggregation")
     else:
         objective = objective._replace(token_scale=None)
     if args.algorithm == "rloo" and objective.agg_mode != "seq-mean-token-sum":
-        raise ValueError("首个RLOO基线固定轨迹token-sum；其他长度权重不冒充相同目标")
+        raise ValueError(
+            "the RLOO baseline sums tokens per trajectory; other length weightings would be a different objective"
+        )
     objective_options = {key: value for key, value in objective._asdict().items() if key != "advantage_estimator"}
     needs_old_logps = args.updates_per_rollout > 1 or args.sampler_is_cap is not None
     if (args.save_every or args.save_at_steps) and args.checkpoint_dir is None:
-        raise ValueError("启用保存时必须指定 --checkpoint-dir，并预留完整 FP32 master/Adam 状态空间")
+        raise ValueError("saving requires --checkpoint-dir with room for the full FP32 master/Adam state")
     if args.model_path is None:
         snapshots = sorted(Path.home().glob(".cache/huggingface/hub/models--google--gemma-4-E2B-it/snapshots/*"))
         if len(snapshots) != 1:
-            raise ValueError("需要明确 --model-path（未找到唯一的 E2B-it snapshot）")
+            raise ValueError("--model-path is required (no unique E2B-it snapshot was found)")
         args.model_path = snapshots[0]
     args.model_path = args.model_path.resolve()
     args.output_dir.mkdir(parents=True, exist_ok=False)
@@ -504,9 +591,9 @@ def main() -> None:
         data_provenance = {"source": "openai/gsm8k", "configuration": "main", "split": "train"}
     training_indices, dev_indices = split_holdout_indices(len(dataset), args.dev_size, seed=args.dev_seed)
     if args.prompt_batch_size > len(training_indices):
-        raise ValueError("排除dev后剩余训练题不足一个prompt batch")
+        raise ValueError("fewer training questions than one prompt batch remain after holding out dev")
     if args.eval_split == "train-dev" and (not args.dev_size or args.eval_size > args.dev_size):
-        raise ValueError("train-dev评估需要dev-size>0且eval-size不超过dev-size")
+        raise ValueError("train-dev evaluation requires dev-size > 0 and eval-size <= dev-size")
     write_json(
         args.output_dir / "data_split.json",
         {
@@ -521,7 +608,7 @@ def main() -> None:
     devices_by_id = {int(device.id): device for device in jax.devices()}
     training_ids = list(devices_by_id) if args.training_device_ids is None else args.training_device_ids
     if not training_ids or len(set(training_ids)) != len(training_ids) or set(training_ids) - devices_by_id.keys():
-        raise ValueError("训练设备ID必须非空、不重复且实际存在")
+        raise ValueError("training device IDs must be non-empty, unique and present")
     if args.rollout_backend in ("inference", "inference-distributed"):
         inference_ids = args.inference_device_ids
         if (
@@ -530,9 +617,9 @@ def main() -> None:
             or set(inference_ids) - devices_by_id.keys()
             or set(inference_ids) & set(training_ids)
         ):
-            raise ValueError("推理设备须实际存在、不重复且与训练mesh分离")
+            raise ValueError("inference devices must be present, unique and separate from the training mesh")
     elif process_inference and sorted(devices_by_id) != [0, 1]:
-        raise ValueError("独立进程训练必须实际只看到两个本地TPU设备")
+        raise ValueError("separate-process training must see exactly two local TPU devices")
     mesh = make_mesh([devices_by_id[index] for index in training_ids])
     if args.logprob_backend == "pallas" and (
         mesh.size != 4 or any("TPU v4" not in device.device_kind for device in mesh.devices.flat)
@@ -541,16 +628,18 @@ def main() -> None:
     device_allocation = iteration_device_allocation(args.rollout_backend, training_ids, args.inference_device_ids)
     rows = args.prompt_batch_size * args.group_size
     if rows % mesh.size:
-        raise ValueError(f"生成行数 {rows} 必须能被设备数 {mesh.size} 整除")
+        raise ValueError(f"generated rows ({rows}) must be divisible by the device count ({mesh.size})")
     if args.microbatch_size is not None and (
         args.microbatch_size <= 0 or rows % args.microbatch_size or args.microbatch_size % mesh.size
     ):
-        raise ValueError("microbatch-size 必须整除展开行数且能被设备数整除")
+        raise ValueError("microbatch-size must divide the generated rows and be divisible by the device count")
     eval_batches = []
     eval_fingerprint = None
     if args.eval_every:
         if args.eval_batch_size <= 0 or args.eval_batch_size % mesh.size or args.eval_max_new_tokens <= 0:
-            raise ValueError("评估长度必须为正，eval-batch-size 必须能被设备数整除")
+            raise ValueError(
+                "evaluation lengths must be positive and eval-batch-size must be divisible by the device count"
+            )
         eval_dataset = dataset if args.eval_split == "train-dev" else load_gsm8k("test")
         eval_fingerprint = eval_dataset._fingerprint
         eval_batches = prepare_eval_batches(
@@ -564,7 +653,7 @@ def main() -> None:
             indices=dev_indices[: args.eval_size] if args.eval_split == "train-dev" else None,
             chat=args.prompt_style == "chat",
         )
-    # 首个闭环按完整策略采样；temperature/top-k 的 proposal correction 留给后续算法实验。
+    # Training samples from the full policy; proposal corrections for temperature or top-k are left to later work.
     run_config = {
         "algorithm": "grpo-family-sync-v4",
         "old_policy_protocol": "joint-forward-first-update-capture-v1",
@@ -686,7 +775,7 @@ def main() -> None:
             run_config["inference_weight_transport"] = "gemma4-host-fp32-v1"
             run_config["training_physical_chips"] = [0, 1]
             run_config["inference_physical_chips"] = [2, 3]
-    # 默认chat保持原v4配置；plain的模板协议参与完整checkpoint身份校验。
+    # Chat keeps the original configuration; the plain template protocol is part of the checkpoint identity check.
     if distributed_inference:
         run_config["inference_weight_transport"] = "gemma4-shared-runtime-ici-verified-v1"
         run_config["inference_runtime_versions"] = {
@@ -740,19 +829,15 @@ def main() -> None:
     source_root = Path(__file__).resolve().parents[1]
     revision, diff = source_git_state(source_root)
     (args.output_dir / "source.diff").write_text(diff or "")
-    source_files = [*sorted((source_root / "gemma4_posttrain_jax").rglob("*.py")), Path(__file__).resolve()]
     write_json(
         args.output_dir / "meta.json",
         {
             "run_config": run_config,
             "timing_protocol": TIMING_PROTOCOL,
             "device_allocation": device_allocation,
+            # Uncommitted changes are written to source.diff as is; both fields are null outside a git checkout.
             "git_commit": revision,
-            "source_diff_sha256": None if diff is None else hashlib.sha256(diff.encode()).hexdigest(),
-            "source_files_sha256": {
-                str(path.relative_to(source_root)): hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in source_files
-            },
+            "uncommitted_changes": None if diff is None else bool(diff),
             "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
             "devices": [str(device) for device in jax.devices()],
             "eval_dataset_fingerprint": eval_fingerprint,
@@ -764,7 +849,7 @@ def main() -> None:
         str(args.model_path), dtype=jnp.float32 if lora_config is None else jnp.bfloat16
     )
     params = shard_gemma4_text_params(host_params, config, mesh)
-    # 参考模型始终来自初始 checkpoint，不随策略更新；beta=0 时不加载参考模型参数。
+    # The reference model always comes from the initial weights and is never updated; it is not loaded when beta=0.
     reference_host = None
     if args.beta:
         with jax.default_device(jax.devices("cpu")[0]):
@@ -780,7 +865,8 @@ def main() -> None:
         state = replicate_scalars(init_train_state(params, optimizer), mesh)
     else:
         frozen_base = params
-        # fold-in固定命名空间，与采样的seed/cursor流分开；恢复仍读完整未缩放A/B与Adam。
+        # fold_in uses a fixed namespace separate from the sampling seed/cursor stream;
+        # resume reads the full unscaled A/B and Adam state.
         adapters = init_lora_params(params, lora_config, jax.random.fold_in(jax.random.PRNGKey(args.seed), 0x4C4F5241))
         adapters = jax.device_put(adapters, NamedSharding(mesh, P()))
         optimizer, trainable = make_lora_optimizer(args.learning_rate), None
@@ -789,7 +875,8 @@ def main() -> None:
     state_shardings = tree_shardings(state)
     behavior_snapshot = None
     if args.resume:
-        # 只保留形状模板，先释放初始化态，再放置恢复态，避免两份 Adam/master 同时占 HBM。
+        # Keep only a shape template and free the initial state before placing the restored one,
+        # so two copies of master/Adam never share HBM.
         template = jax.eval_shape(lambda: state)
         del state
         if args.rollout_lag_updates:
@@ -809,11 +896,11 @@ def main() -> None:
     )
     data_cursor = 0 if resume is None else resume.get("data_cursor")
     if not isinstance(data_cursor, int) or data_cursor < start_step // args.updates_per_rollout:
-        raise ValueError("checkpoint缺少有效的候选batch数据游标")
+        raise ValueError("checkpoint has no valid candidate-batch data cursor")
     if not args.dynamic_sampling and data_cursor != start_step // args.updates_per_rollout:
-        raise ValueError("固定采样的数据游标与完整rollout边界不一致")
+        raise ValueError("the data cursor does not fall on a complete rollout boundary")
     if start_step >= args.max_steps:
-        raise ValueError(f"checkpoint step {start_step} 已达到 max-steps {args.max_steps}")
+        raise ValueError(f"checkpoint step {start_step} has already reached max-steps {args.max_steps}")
     state_bytes = sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(state))
     behavior_bytes = (
         sum(leaf.size * 2 for leaf in jax.tree.leaves(state.params_f32)) + 4 if args.rollout_lag_updates else 0
@@ -824,7 +911,9 @@ def main() -> None:
     if future_checkpoint:
         args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         if shutil.disk_usage(args.checkpoint_dir).free < state_bytes + behavior_bytes + 2**30:
-            raise ValueError(f"checkpoint 需要至少 {(state_bytes + behavior_bytes) / 2**30:.2f} GiB 加 1 GiB 余量")
+            raise ValueError(
+                f"checkpoint needs at least {(state_bytes + behavior_bytes) / 2**30:.2f} GiB plus 1 GiB of headroom"
+            )
     print(
         json.dumps(
             {
@@ -1016,14 +1105,17 @@ def main() -> None:
                 final_audit = summarize_train_state(state)
                 write_json(args.output_dir / "final_state_audit.json", final_audit)
                 if not final_audit["all_finite"]:
-                    raise RuntimeError("最终训练状态包含非有限值；检查结果已保存")
+                    raise RuntimeError(
+                        "the final training state contains non-finite values; the check result was saved"
+                    )
             except BaseException as error:
                 if primary is None:
                     raise
-                primary.add_note(f"最终训练状态检查也失败：{type(error).__name__}: {error}")
+                primary.add_note(f"the final training state check also failed: {type(error).__name__}: {error}")
 
-        # 最先登记，最后执行：先关闭引擎，避免完整读回与推理工作区同时占用内存。
-        # ExitStack 在其他关闭操作抛错后仍会执行此检查，同时保留原始异常。
+        # Registered first so it runs last: the engine is closed before the full readback,
+        # so the two never hold memory at the same time.
+        # ExitStack still runs this check when an earlier cleanup raises, and keeps the original exception.
         stack.push(record_final_state)
         inference_rollout = None
         inference_samples = None
@@ -1070,9 +1162,9 @@ def main() -> None:
                 if not report.get("complete"):
                     primary = sys.exception()
                     if primary is not None:
-                        primary.add_note("独立引擎关闭也未完整通过，见inference_close.json；保留原始失败")
+                        primary.add_note("closing the separate engine also failed; see inference_close.json")
                     else:
-                        raise RuntimeError("独立引擎关闭未完整通过，见inference_close.json")
+                        raise RuntimeError("closing the separate engine did not complete; see inference_close.json")
 
             stack.callback(close_inference)
             write_json(
@@ -1081,7 +1173,10 @@ def main() -> None:
                     "load_and_initialize_s": time.perf_counter() - engine_init_started,
                     "first_generate_includes_jit": True,
                     "metadata": runtime.metadata,
-                    "计时说明": "引擎首次生成包含按实际采样配置编译，不计为稳态；初始化和真实权重运输另列。",
+                    "timing_note": (
+                        "The first engine generate includes compilation and is not steady state; "
+                        "initialization and weight transfer are listed separately."
+                    ),
                 },
             )
             inference_rollout = InferenceRollout(runtime, config, sampler_config=sampler_config, mesh=mesh)
@@ -1093,6 +1188,8 @@ def main() -> None:
             run_name=args.wandb_run_name,
             tags=args.wandb_tags,
             config={"logging_mode": "live", "source_metadata": json.loads((args.output_dir / "meta.json").read_text())},
+            group=args.wandb_group,
+            job_type=args.wandb_job_type,
         )
         tracker_init_s = time.perf_counter() - tracker_init_start
         stack.callback(tracker.finish)
@@ -1147,7 +1244,7 @@ def main() -> None:
             step_start = time.perf_counter()
             behavior_step = step if behavior_snapshot is None else int(behavior_snapshot.step)
             if behavior_step != max(0, step - args.rollout_lag_updates):
-                raise RuntimeError("采样权重没有保持声明的一次Adam滞后")
+                raise RuntimeError("rollout weights did not keep the declared one-update lag")
             if inference_rollout is not None:
                 _, reshard_s = timed_call(partial(inference_rollout.update_params, version=step), policy_params())
                 rollout_params = None
@@ -1164,10 +1261,27 @@ def main() -> None:
             accepted_groups = attempts = generated_tokens = 0
             prompt_prepare_s = rollout_s = rollout_device_get_s = 0.0
             text_decode_s = reward_s = rollout_record_s = rollout_audit_s = 0.0
+            if args.audit_execution_layout and step == start_step:
+                # Both the training state and the rollout weights are in place before the first rollout. Only shard
+                # attributes are read, and the time counts toward rollout_audit_s.
+                layout_record_start = time.perf_counter()
+                write_json(
+                    args.output_dir / "execution_layout.json",
+                    execution_layout_record(
+                        state,
+                        rollout_params,
+                        mesh,
+                        rollout_backend=args.rollout_backend,
+                        rollout_layout=args.rollout_layout,
+                        logprob_backend=args.logprob_backend,
+                    ),
+                )
+                rollout_audit_s += time.perf_counter() - layout_record_start
             while accepted_groups < args.prompt_batch_size:
                 if attempts == args.max_sampling_attempts:
                     raise RuntimeError(
-                        f"补采{attempts}批后仅保留{accepted_groups}/{args.prompt_batch_size}个有效组；未更新参数，生成证据已保存"
+                        f"only {accepted_groups}/{args.prompt_batch_size} valid groups after {attempts} attempts; "
+                        "parameters were not updated and the generated batches were saved"
                     )
                 prompt_prepare_start = time.perf_counter()
                 positions = grpo_prompt_indices(
@@ -1190,7 +1304,9 @@ def main() -> None:
                 if inference_rollout is not None:
                     rollout, elapsed = timed_call(partial(inference_rollout.generate, key=key), ids, mask)
                     if inference_rollout.last_proposal_logps is None:
-                        raise RuntimeError("完整策略采样未返回实际proposal概率，不能接受训练batch")
+                        raise RuntimeError(
+                            "full-policy sampling returned no proposal probabilities; the training batch cannot be used"
+                        )
                     assert inference_samples is not None and inference_rollout.last_generation is not None
                     inference_samples.write(
                         json.dumps(
@@ -1224,7 +1340,8 @@ def main() -> None:
                         if sampler_config.temperature == 1 and sampler_config.top_k == 0 and sampler_config.top_p == 1
                         else None
                     )
-                    # 原生非T1/full-vocab仅返回raw策略概率；明确缺失proposal，禁止伪造。
+                    # Native sampling other than T=1 over the full vocabulary returns only raw policy probabilities;
+                    # mark the proposal as missing.
                     with (audit_dir / f"batch_{data_cursor - 1:08d}.npz").open("xb") as audit_file:
                         np.savez(
                             audit_file,
@@ -1344,13 +1461,16 @@ def main() -> None:
                     completion_loss_mask(rollout.completion_mask, jnp.asarray(truncated), filter_truncated=True), mesh
                 )
                 if not np.asarray(loss_mask).any():
-                    raise RuntimeError("整批loss mask为空，保留生成记录并停止，不执行无信号的Adam更新")
+                    raise RuntimeError(
+                        "the loss mask of the whole batch is empty; stopping before the update (rollouts are kept)"
+                    )
             token_arguments = (ids, mask, rollout.completion_ids, rollout.completion_mask)
             reference_logps = None
             batch_prepare_s = time.perf_counter() - batch_prepare_start
             reference_transfer_s = reference_logps_s = startup_logps_s = 0.0
             if reference_host is not None:
-                # 参考模型与 rollout 复制工作区不能同时常驻 v4 HBM；只在本阶段放入 FSDP 分片。
+                # The reference model and the replicated rollout workspace cannot both stay in v4 HBM;
+                # its FSDP shards are placed only for this stage.
                 reference, reference_transfer_s = timed_call(
                     lambda: shard_gemma4_text_params(reference_host, config, mesh)
                 )
@@ -1361,7 +1481,8 @@ def main() -> None:
                 reference_logps, reference_logps_s = timed_call(reference_executable, reference, *token_arguments)
                 del reference
             reference_s = reference_transfer_s + reference_logps_s
-            # 独立前向仅作为首批sampler诊断；μ轮old从实际联合梯度前向捕获。
+            # This separate forward is only a first-batch sampler diagnostic; the old logprobs
+            # for the mu updates come from the joint gradient forward.
             old_logps_s = 0.0
             is_weights = None
             parity_arrays = None
@@ -1432,9 +1553,11 @@ def main() -> None:
                 filename = "startup_parity_batch.npz" if needs_old_logps else "parity_batch.npz"
                 np.savez(args.output_dir / filename, allow_pickle=False, **parity_arrays)
                 if drift_gate["action"] == "stop-before-update":
-                    raise RuntimeError("启动独立前向H2 drift gate 未通过；已保存固定输入，尚未更新参数")
+                    raise RuntimeError(
+                        "the startup sampler/trainer drift check failed; inputs were saved and no update was made"
+                    )
                 if not np.isfinite(np.asarray(trainer_logps)[completion_mask]).all():
-                    raise RuntimeError("trainer logprob 含非有限值")
+                    raise RuntimeError("trainer logprobs contain non-finite values")
                 del trainer_logps, behavior_trainer_logps, logps_executable
                 logps_executable = None
             old_for_update = shard_batch(np.zeros(completion_ids.shape, np.float32), mesh) if needs_old_logps else None
@@ -1462,7 +1585,8 @@ def main() -> None:
                 iteration_start = step_start if iteration == 0 else time.perf_counter()
                 behavior_snapshot_s = 0.0
                 if capture_executable is not None and iteration == args.updates_per_rollout - 1:
-                    # 在最后一次Adam前捕获；下一轮恰好滞后一次更新，而不是滞后整个μ轮。
+                    # Capture before the last Adam update so the next rollout lags by exactly one update,
+                    # not by the whole mu round.
                     snapshot_start = time.perf_counter()
                     captured_params = capture_executable(state.params_f32)
                     behavior_snapshot = BehaviorSnapshot(
@@ -1489,14 +1613,17 @@ def main() -> None:
                     write_json(args.output_dir / f"update_witness_{step + 1:08d}.json", witness)
                     del witness_before, witness_after
                     if not witness["all_finite"] or witness["after_step"] != witness["before_step"] + 1:
-                        raise RuntimeError("实际参数更新观察非有限或Adam步数未推进")
+                        raise RuntimeError(
+                            "the observed parameter update is non-finite or the Adam step did not advance"
+                        )
                     update_audit_s += time.perf_counter() - audit_start
 
                 if needs_old_logps and iteration == 0:
                     if metrics.policy_logps is None:
-                        raise RuntimeError("联合图没有返回轮内old logps")
+                        raise RuntimeError("the joint graph did not return the old logprobs for this round")
                     old_for_update = shard_batch(metrics.policy_logps, mesh)
-                    # 后续μ更新只读这份首次前向数组；不能被第二次current logps覆盖。
+                    # Later updates in the round read only this first-forward array;
+                    # later current logprobs must not overwrite it.
                     update_batch = (
                         *token_arguments,
                         advantages,
@@ -1546,12 +1673,12 @@ def main() -> None:
                     )
                     update_audit_s += time.perf_counter() - audit_start
                 if not all(np.isfinite(value) for value in values.values()):
-                    raise RuntimeError(f"step {step + 1} loss/gradient/metrics 含非有限值：{values}")
+                    raise RuntimeError(f"step {step + 1} loss/gradient/metrics contain non-finite values: {values}")
                 if (args.updates_per_rollout == 1 or iteration == 0) and (values["ratio_min"], values["ratio_max"]) != (
                     1.0,
                     1.0,
                 ):
-                    raise RuntimeError("首个联合前向的old/current ratio不再为1")
+                    raise RuntimeError("the old/current ratio of the first joint forward is not 1")
                 row = {
                     "step": step + 1,
                     "rollout_step": rollout_step + 1,
@@ -1626,7 +1753,7 @@ def main() -> None:
                     "unattributed_s": 0.0,
                 }
                 if lora_config is not None:
-                    # 原6*2.3B估计只适用于旧E2B全参数图，不用于冻结base的LoRA性能声明。
+                    # The 6*2.3B estimate only applies to the full-parameter E2B graph, not to LoRA with a frozen base.
                     row.pop("update_mfu_estimate")
                 if (args.save_every and (step + 1) % args.save_every == 0) or (step + 1) in (args.save_at_steps or []):
                     checkpoint_start = time.perf_counter()

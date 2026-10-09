@@ -19,6 +19,7 @@
 | LoRA | 实现 attention Q/K/V/O 投影的适配器，接入原生 GRPO 训练、保存、恢复和独立评估 |
 | tpu-inference | 实验性生成后端，推荐同进程接入并通过 ICI 向推理芯片同步权重；双进程方案（经主机中转或共用分布式运行时）仅保留为开发对照，区别与配置见[整体设计](docs/design-overview.md) |
 | 保存与恢复 | 分块写出设备数组，保存参数、优化器状态及续训所需的随机配置和数据位置；按目标分片加载，提供连续训练与新进程续训的比较脚本 |
+| 完整实验 | GSM8K 上 200 步的标准 GRPO 实验：训练前检查数据，连续训练，中途换新进程续训，再独立加载训练结果评估；自动比较续训结果、汇总评估曲线和耗时，可记录到 W&B |
 | 数据、评估与诊断 | GSM8K、MATH 数据处理与奖励计算，独立评估和训练期间评估；记录训练指标、概率差异、编译与内存信息，可选接入 W&B |
 | Pallas LM-head/logprob | 四芯片 TPU v4、BF16 的可选训练后端；保留原生前向和 hidden 梯度，用 Pallas 计算部分权重梯度，目前仍为实验选项|
 | 单 chip Pallas attention | 针对 TPU v4 的 Splash 前向、反向、双 TensorCore 分工与存储优化；目前是独立实验实现 |
@@ -29,7 +30,8 @@
 
 - 主要验证环境是 E2B 和单机 TPU v4-8；E4B 有部分实验。
 - 12B LoRA 尚需在真实 TPU 上完成训练与恢复验证。
-- tpu-inference 的 ICI 权重同步和 checkpoint 分块保存已通过 TPU 数组测试，但这不能替代完整 E2B 训练、保存和新进程续训的验证（后者仍待完成）。
+- 使用原生 JAX 生成时，E2B 已在 GSM8K 上完整运行 200 步：第 100 步由新进程续训，结果与连续训练逐项一致，独立加载 checkpoint 的评估也与训练中相同；dev 准确率从 84.8% 升到 89.1%（单个种子），见[完整实验的结果](examples/e2b_grpo_gsm8k.md)。
+- tpu-inference 的 ICI 权重同步已通过 TPU 数组测试，但在 tpu-inference 路径下，完整的 E2B 训练、保存和新进程续训还没有验证。
 - 分块 logprob 和词表并行已用于训练；Pallas LM-head/logprob 需显式启用，长期 GRPO 数值差异尚未解决。Pallas attention 的局部结果仍需在完整模型中验证。
 
 **已知限制**
@@ -90,6 +92,17 @@ bash examples/e2b_sft_smoke.sh /path/to/e2b-snapshot /path/to/new-sft
 ```bash
 bash examples/e2b_grpo_recovery.sh /path/to/e2b-snapshot /path/to/new-grpo
 ```
+
+### GRPO 完整实验
+
+在 GSM8K 上训练 200 步：第 100 步换一个新进程接着训练，最后单独加载训练结果评估，并检查续训是否与连续训练完全一致。在 TPU v4-8 上需要一个多小时，运行中最多同时存在两份完整训练状态（每份约 52 GiB）。
+
+```bash
+WANDB_PROJECT=gemma4_posttrain_jax \
+  bash examples/e2b_grpo_gsm8k.sh /path/to/e2b-snapshot /path/to/new-run
+```
+
+不设置 `WANDB_PROJECT` 就不连接 W&B。配置、检查内容和输出说明见[示例说明](examples/e2b_grpo_gsm8k.md)。
 
 各示例的目的、具体步骤和输出说明同样见[快速开始](docs/quickstart.md)。
 

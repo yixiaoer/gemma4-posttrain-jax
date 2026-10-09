@@ -1,4 +1,4 @@
-"""恢复检查只补齐不改变行为的旧默认值，其他差异必须拒绝。"""
+"""Resume checks fill in only old defaults that do not change behavior; any other difference is rejected."""
 
 import importlib.util
 from pathlib import Path
@@ -20,7 +20,7 @@ def test_legacy_beta_zero_is_compatible_without_mutating_saved_config():
 
 
 def test_legacy_nonzero_kl_requires_original_implementation():
-    with pytest.raises(ValueError, match="不能按新 K3 实现精确续训"):
+    with pytest.raises(ValueError, match="cannot be resumed exactly with the new K3"):
         trainer.validate_resume_config({"beta": 0.04}, {"beta": 0.04, "kl_estimator": "k3-stable-series-v2"})
 
 
@@ -55,5 +55,5 @@ def test_missing_field_is_not_equal_to_explicit_none():
 
 @pytest.mark.parametrize("saved", [None, [], "wrong"])
 def test_invalid_metadata_is_rejected(saved):
-    with pytest.raises(ValueError, match="训练配置"):
+    with pytest.raises(ValueError, match="training configuration"):
         trainer.validate_resume_config(saved, {})

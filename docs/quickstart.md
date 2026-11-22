@@ -1,10 +1,12 @@
-# QuickStart
+# Quickstart
 
-这篇文档从安装开始，依次介绍文本生成、SFT、GRPO、保存和继续训练、完整的 GRPO 实验，以及测试与验证范围。所有命令都在仓库根目录运行。训练示例使用 Gemma 4 E2B 和四个 TPU v4 JAX 设备。
+**English** | [简体中文](quickstart.zh-CN.md)
 
-## 1. 搭环境
+This guide covers installation, text generation, SFT, GRPO, checkpoint save and restore, the complete GRPO experiment, and the scope of the tests. Run all commands from the repository root. The training examples use Gemma 4 E2B and four TPU v4 JAX devices.
 
-需要 Python 3.12。建议为项目创建独立环境：
+## 1. Set up the environment
+
+Python 3.12 is required. Create a dedicated environment for the project:
 
 ```bash
 python3.12 -m venv .venv
@@ -13,134 +15,134 @@ python3.12 -m venv .venv
 .venv/bin/python scripts/check_env.py --backend tpu
 ```
 
-如果只在 CPU 上开发或跑测试，把安装选项换成 `.[hf,dev]`，检查时加前缀：
+For CPU development and testing, use the installation extra `.[hf,dev]` and select the CPU backend when checking the environment:
 
 ```bash
 JAX_PLATFORMS=cpu .venv/bin/python scripts/check_env.py --backend cpu
 ```
 
-CPU 模式只检查版本和矩阵计算；TPU 模式还会跑一个小 Pallas kernel。
+The CPU check verifies versions and matrix computation. The TPU check also runs a small Pallas kernel.
 
-以上安装用于原生 JAX 路径。tpu-inference 适配层依赖固定版本与源码，不能直接在引擎环境执行这组升级命令。接入引擎时推荐同进程执行、通过 ICI 同步权重；双进程和主机中转仅保留为开发对照。该接入仍属于实验配置，具体区别与适用范围见[整体设计](design-overview.md)。
+These installation commands are for the native JAX implementation. The tpu-inference adapter depends on pinned versions and source code; do not run these upgrade commands directly in an existing engine environment. The recommended engine configuration runs in the same process and synchronizes weights over ICI. Two-process and host-transfer configurations remain available as research controls. The integration is experimental; see the [design overview](design-overview.md) for the differences and supported scope.
 
-**模型准备：** 下载 `google/gemma-4-E2B-it` 到本地目录（需包含配置、tokenizer、safetensors 权重）。下文统一用 `/path/to/e2b-snapshot` 指代，运行前替换成实际路径。
+**Model:** Download `google/gemma-4-E2B-it` to a local directory containing its configuration, tokenizer, and safetensors weights. Replace `/path/to/e2b-snapshot` below with that directory.
 
-**数据：** SFT 短测试自带内置问答，不需要额外数据。GRPO 用 GSM8K，首次运行会自动下载；如果已有缓存，可设 `HF_HUB_OFFLINE=1` 和 `HF_DATASETS_OFFLINE=1` 离线运行。
+**Data:** The short SFT test includes its own question-answer pair. GRPO uses GSM8K and downloads it on the first run. With an existing cache, set `HF_HUB_OFFLINE=1` and `HF_DATASETS_OFFLINE=1` to run offline.
 
-## 2. 生成回答
+## 2. Generate responses
 
-最简单的 greedy 生成：
+For greedy generation:
 
 ```bash
 .venv/bin/python scripts/generate.py \
   --model /path/to/e2b-snapshot --chat \
-  --prompt "计算3乘4再加2。" --max-new-tokens 64
+  --prompt "Calculate 3 times 4, then add 2." --max-new-tokens 64
 ```
 
-加上采样参数，或一次传多条 prompt：
+To sample, or pass multiple prompts in one call:
 
 ```bash
 .venv/bin/python scripts/generate.py \
   --model /path/to/e2b-snapshot --chat \
-  --prompt "解释什么是梯度。" --prompt "计算3乘4再加2。" \
+  --prompt "Explain what a gradient is." --prompt "Calculate 3 times 4, then add 2." \
   --temperature 0.8 --top-k 50 --top-p 0.9 --seed 42 \
   --max-new-tokens 128
 ```
 
-几个实用选项：`--top-k 0 --top-p 1` 关闭候选截断；`--compare-hf` 同时用 Transformers 在 CPU 上跑一遍对比（需要额外内存，且两个框架随机数实现不同，同种子结果可能不一样）。
+Use `--top-k 0 --top-p 1` to disable candidate truncation. `--compare-hf` also runs Transformers on the CPU for comparison; this requires additional memory, and the two frameworks may produce different samples with the same seed because their random-number implementations differ.
 
-## 3. 运行 SFT
+## 3. Run SFT
 
 ```bash
 bash examples/e2b_sft_smoke.sh /path/to/e2b-snapshot /path/to/new-sft
 ```
 
-这是一个快速示例测试，用来确认训练流程能跑通。
+This is a short smoke test of the training workflow.
 
-**它做了什么：** 脚本内置一道球数计算题（三排红球×4 + 两个蓝球 = 14），复制 4 份凑成 batch size 4（对应 4 块 TPU），序列长度统一到 128 token，然后在这同一批数据上连跑 4 步。
+**What it does:** The script uses a built-in counting question: three rows of four red balls plus two blue balls gives 14 balls. It makes four copies for a batch size of four, matching the four TPUs, pads sequences to 128 tokens, and trains on the same batch for four steps. Each step:
 
-1. 前向传播，算出答案部分的 loss（模型预测与正确答案的差距）。
-2. 反向传播，得到各可训练参数的梯度。
-3. Adam 优化器根据梯度和历史状态更新参数。
+1. Runs the forward pass and computes loss on the answer tokens.
+2. Backpropagates to obtain gradients for the trainable parameters.
+3. Updates parameters using Adam and its accumulated state.
 
-固定输入是为了观察 loss 变化；跑多步是为了验证参数/优化器状态能正确传递，以及后续步骤复用编译缓存。4 步只是测试选的数字，没有特殊含义。
+Keeping the input fixed makes loss changes easier to inspect. Running several steps checks that parameters and optimizer state carry forward correctly and that later steps reuse the compilation cache. Four is simply the chosen test length.
 
-**配置：** 学习率 `1e-4`，冻结 embedding，不用重计算。结果写入 `metrics.csv`（含每步 loss、梯度范数、耗时）。
+**Configuration:** Learning rate `1e-4`, frozen embeddings, and no rematerialization. Results are written to `metrics.csv`, including each step's loss, gradient norm, and elapsed time.
 
-**正式训练 GSM8K：** 直接用 `scripts/train_sft.py`，去掉 `--overfit-one-batch`。
+**Train on GSM8K:** Run `scripts/train_sft.py` directly without `--overfit-one-batch`.
 
-**保存和续训：** 冒烟测试默认不保存。需要时在 `scripts/train_sft.py` 里加 `--save-every`、`--checkpoint-dir`、`--resume`。
+**Save and resume:** The smoke test does not save checkpoints by default. Use `--save-every`, `--checkpoint-dir`, and `--resume` with `scripts/train_sft.py` when needed.
 
-**换 Python 解释器：** 两个 shell 示例默认用 `.venv/bin/python`，可通过 `PYTHON_BIN=/absolute/path/to/python` 覆盖。
+**Choose a Python interpreter:** The SFT and recovery shell examples default to `.venv/bin/python`. Override this with `PYTHON_BIN=/absolute/path/to/python`.
 
-
-## 4. 运行 GRPO + 断点恢复验证
+## 4. Run GRPO and verify checkpoint recovery
 
 ```bash
 bash examples/e2b_grpo_recovery.sh /path/to/e2b-snapshot /path/to/new-grpo
 ```
 
-这个示例的核心目的是验证：中断后恢复训练，结果与连续训练完全一致。
+This example checks whether training resumed after an interruption exactly matches uninterrupted training.
 
-**流程：**
-1. 从初始模型训练 4 步，在第 2、4 步保存完整状态。
-2. 新进程加载第 2 步状态，继续训练到第 4 步。
-3. 两个进程分别加载连续训练和恢复训练的末步状态，在相同 4 道题上生成回答。
-4. 逐项比较：最终参数、Adam 状态、随机状态、数据读取位置、生成样本、评估结果。
+**Workflow:**
 
-**训练配置：** 每轮 2 道题 × 4 个回答，prompt ≤ 512 token，回答 ≤ 256 token，microbatch 4。学习率 `1e-6`，KL 系数 0，冻结 embedding，开启重计算，seed 0。动态补采最多 16 次；未参与更新的样本也会记录（用于校验随机数和数据顺序）。
+1. Train the initial model for four steps, saving complete states at steps 2 and 4.
+2. Start a new process, load the step-2 state, and continue to step 4.
+3. Use separate processes to load the final states from uninterrupted and resumed training, then generate responses to the same four questions.
+4. Compare the final parameters, Adam state, random state, data position, generated samples, and evaluation results.
 
-**评估：** 用预先划出的 500 题，取 4 题检查模型是否正确保存和恢复——不能据此判断训练质量。
+**Training configuration:** Two prompts per iteration, four responses each, prompts up to 512 tokens, responses up to 256 tokens, and microbatch size 4. The learning rate is `1e-6`, the KL coefficient is 0, embeddings are frozen, rematerialization is enabled, and the seed is 0. Dynamic resampling allows up to 16 attempts. Samples excluded from updates are also recorded so that random-number use and data order can be checked.
 
-### KL 计算
+**Evaluation:** Four questions from a held-out set of 500 check that the model was saved and restored correctly. This is too small to assess training quality.
 
-默认 `--beta 0`，不算 KL。需要时设正数，如 `--beta 0.04`。
+### KL computation
 
-公式采用 K3：令 `d = reference_logprob - policy_logprob`，KL = `exp(d) - d - 1`。数值处理上，接近零时用多项式近似，范围外用高精度 `expm1`，以减小相减误差和 TPU 默认近似的偏差。
+The default `--beta 0` disables KL. Set a positive value, such as `--beta 0.04`, to enable it.
 
-可选 `--kl-clamp-value 10000` 对每个 token 的 KL 设上限（超限后该 token 的 KL 梯度为零，指数溢出前就会处理）。这和接近零的数值修正是两个独立选项。上限必须为正有限数、不超过 FP32 最大值，且只能搭配正 `beta` 使用。
+The implementation uses K3: with `d = reference_logprob - policy_logprob`, KL is `exp(d) - d - 1`. Near zero, a polynomial approximation reduces cancellation; elsewhere, a high-precision `expm1` reduces error from the TPU's default approximation.
 
-**旧状态兼容：** 新状态会记录 K3 版本和上限值。旧 `beta=0` 状态缺这两个字段时，按原逻辑（不用 KL）继续训练。旧的非零 KL 状态如果版本缺失或不匹配，会拒绝续训——要继续原实验，请用保存该状态的代码。
+The optional `--kl-clamp-value 10000` caps each token's KL contribution. Its KL gradient becomes zero above the cap, and the implementation handles the limit before exponential overflow. This cap is independent of the numerical correction near zero. It must be positive and finite, no larger than the maximum FP32 value, and used with a positive `beta`.
 
-### 磁盘和内存
+**Older checkpoints:** New checkpoints record the K3 version and cap. An older `beta=0` checkpoint without these fields continues with KL disabled. Resuming an older checkpoint with nonzero KL is rejected if the version is missing or mismatched; use the code that created that checkpoint to continue the original experiment.
 
-输出目录必须不存在。三个状态文件合计约 100.59 GB（93.69 GiB），加上其他输出，建议预留 ≥ 100 GiB。如果输出在 tmpfs 上，文件还会占主机内存。实测进程组内存峰值约 186.77 GiB（具体取决于模型、输入形状和环境）。
+### Disk and memory requirements
 
-### 输出结构
+The output directory must not already exist. The three state files total about 100.59 GB (93.69 GiB); allow at least 100 GiB including other outputs. Files on tmpfs also consume host memory. The measured process-group memory peak was about 186.77 GiB, with the actual requirement depending on the model, input shapes, and environment.
+
+### Output structure
 
 ```
 new-grpo/
-  baseline/                   连续训练记录（配置、指标、样本、参数变化）
-  baseline-checkpoints/       第 2、4 步完整状态
-  resume/                     恢复后第 3、4 步训练记录
-  resume-checkpoints/         恢复训练第 4 步状态
-  eval-baseline/evaluation/   连续训练模型的逐题预测和评分
-  eval-resume/evaluation/     恢复训练模型的逐题预测和评分
-  recovery_check.json         比较结果（所有检查通过时 complete: true）
+  baseline/                   Uninterrupted training: configuration, metrics, samples, parameter changes
+  baseline-checkpoints/       Complete states at steps 2 and 4
+  resume/                     Resumed training records for steps 3 and 4
+  resume-checkpoints/         Resumed state at step 4
+  eval-baseline/evaluation/   Per-question predictions and scores from uninterrupted training
+  eval-resume/evaluation/     Per-question predictions and scores from resumed training
+  recovery_check.json         Comparison results (complete: true when all checks pass)
 ```
 
-如果运行中断，保留已有输出用于排查；重新运行整个示例时指定新的输出目录。
+If a run is interrupted, keep its outputs for diagnosis and use a new output directory when rerunning the complete example.
 
-### 重新比较 / 手动续训
+### Repeat the comparison or resume manually
 
-对已完成的示例重新跑比较：
+To compare an already completed example again:
 
 ```bash
 .venv/bin/python scripts/compare_recovery.py /path/to/new-grpo \
   --rescore --output /path/to/new-recovery-check.json
 ```
 
-`--rescore` 会用本地 tokenizer 从记录的 token ID 重新解码评分。比较脚本不会重新训练，但会读取三个大状态文件。
+`--rescore` decodes recorded token IDs with the local tokenizer and scores the resulting text again. The comparison script does not retrain the model, but it does read all three large state files.
 
-手动续训时，`--resume` 指向具体步骤目录（如 `step_00000002`），`--max-steps 4` 是全局步数上限（不是恢复后再跑 4 步）。恢复要求模型、数据、采样和训练配置一致，脚本会检查。
+For manual recovery, point `--resume` to a specific step directory, such as `step_00000002`. `--max-steps 4` sets the global step limit; it does not request four additional steps after recovery. The script checks that the model, data, sampling, and training configuration match.
 
-SFT 和 GRPO 示例各自从初始模型开始。把 SFT 结果接到 GRPO 需要手动处理权重和状态转换，示例没有自动完成这一步。
+The SFT and GRPO examples each start from the initial model. Continuing from SFT into GRPO requires manual weight and state conversion; the examples do not perform that conversion automatically.
 
-## 5. 选择生成布局并运行完整实验
+## 5. Choose a generation layout and run the complete experiment
 
-### 使用张量并行生成
+### Tensor-parallel generation
 
-全参数同步 GRPO 可以选择张量并行（TP）生成布局。下面的命令按当前策略采样回答，适合进行训练。
+Synchronous GRPO with full-parameter updates supports a tensor-parallel (TP) generation layout. The following command samples responses from the current policy for training:
 
 ```bash
 JAX_DEFAULT_MATMUL_PRECISION=highest .venv/bin/python scripts/train_grpo.py \
@@ -151,26 +153,26 @@ JAX_DEFAULT_MATMUL_PRECISION=highest .venv/bin/python scripts/train_grpo.py \
   --learning-rate 1e-6 --beta 0 --remat --no-dynamic-sampling --no-filter-truncated-loss
 ```
 
-恢复时继续指定 `--rollout-layout tp --tp-allreduce auto`，并保持其它训练配置一致；`auto` 会继承 checkpoint 中实际使用的归约方式。独立评估默认继承 checkpoint 的布局与归约方式。CPU 的 TP 数值检查使用 `--tp-allreduce xla`；融合 Pallas 路径需要 TPU。
+When resuming, keep `--rollout-layout tp --tp-allreduce auto` and the other training settings unchanged. `auto` inherits the reduction mode actually used by the checkpoint. Independent evaluation also inherits the checkpoint's layout and reduction mode by default. CPU TP numerical checks use `--tp-allreduce xla`; the fused Pallas implementation requires a TPU.
 
-TP 生成使用与其他原生生成布局相同的 checkpoint 和评估机制。比较不同布局的性能时，应保持模型、输入、采样参数和计时范围一致。
+TP generation uses the same checkpoint and evaluation mechanisms as the other native generation layouts. Keep the model, inputs, sampling parameters, and timing boundaries consistent when comparing layouts.
 
-### 运行完整的 GSM8K 示例
+### Complete GSM8K experiment
 
-上面的恢复示例训练 4 步，便于保存并逐项比较所有状态。下面的完整实验在 GSM8K 上训练 200 步，第 100 步换新进程续训，最后单独加载训练结果评估，并自动检查续训是否与连续训练一致。
+The recovery example above runs four steps to make it practical to save and compare all state. The complete experiment below trains for 200 GSM8K steps, resumes in a new process at step 100, independently evaluates the final checkpoint, and automatically checks resumed results against uninterrupted training.
 
 ```bash
 WANDB_PROJECT=gemma4_posttrain_jax \
   bash examples/e2b_grpo_gsm8k.sh /path/to/e2b-snapshot /path/to/new-run /path/to/checkpoints
 ```
 
-正式运行需要一个多小时，建议先用 `MAX_STEPS=4 RESUME_STEP=2 EVAL_EVERY=2 EVAL_SIZE=8` 试一遍。实验配置、每个阶段做什么、怎样读比较结果和 W&B 曲线，见[示例说明](../examples/e2b_grpo_gsm8k.md)。
+A complete run takes more than an hour. First try `MAX_STEPS=4 RESUME_STEP=2 EVAL_EVERY=2 EVAL_SIZE=8` for a shorter check. See the [experiment guide](../examples/e2b_grpo_gsm8k.md) (Chinese) for configuration, stages, comparison results, and W&B curves.
 
 ---
 
-## 6. 单独评估
+## 6. Run independent evaluation
 
-例如评估 GRPO 第 4 步：
+For example, evaluate the GRPO step-4 checkpoint:
 
 ```bash
 .venv/bin/python scripts/evaluate_gsm8k.py \
@@ -180,38 +182,38 @@ WANDB_PROJECT=gemma4_posttrain_jax \
   --max-prompt-len 512 --max-new-tokens 256 --reward-workers 2
 ```
 
-输出包含逐题回答、标准答案、评分、生成长度和 token ID。也支持初始模型和 MATH 数据，详见 `--help`。
+Outputs include each question's generated answer, reference answer, score, generated length, and token IDs. Evaluation also supports the initial model and MATH data; see `--help`.
 
-加上 `--audit-loaded-state`，评估前会把加载到的参数和 Adam 状态完整读一遍，为每个数组记下校验值，写入 `loaded_state_audit.json`，用来和训练结束时的记录对照，确认存档被完整读回。完整读一遍要花一些时间，所以默认不开。
+With `--audit-loaded-state`, evaluation first reads every loaded parameter and Adam-state array and writes their checksums to `loaded_state_audit.json`. Comparing these against the records from the end of training checks that the saved state was fully read back. This complete read takes additional time, so the option is disabled by default.
 
-## 7. 测试与验证范围
+## 7. Tests and validation scope
 
-安装 `.[hf,dev]` 后，可以在 CPU 上运行核心测试：
+After installing `.[hf,dev]`, run the core CPU tests with:
 
 ```bash
 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 \
   .venv/bin/python -m pytest -m 'not tpu and not full_model'
 ```
 
-四个 CPU 虚拟设备用于检查分片规则和设备间数据一致性，不能代表 TPU 性能。部分 Linux 进程测试在其他系统上跳过；要求恰好两个设备的 RNG 测试可单独运行：
+Four virtual CPU devices check sharding rules and consistency across devices; they do not measure TPU performance. Some Linux process tests are skipped on other systems. RNG tests requiring exactly two devices can be run separately:
 
 ```bash
 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=2 \
   .venv/bin/python -m pytest tests/test_inference_rng.py
 ```
 
-滞后生成和候选批次记录的 CPU 用例按单个设备编写，在四个虚拟设备下会自动跳过，需要不设置 `XLA_FLAGS` 单独运行：
+The CPU tests for stale rollout and candidate-batch recording assume a single device and skip themselves with four virtual devices. Run them separately with `XLA_FLAGS` unset:
 
 ```bash
 JAX_PLATFORMS=cpu .venv/bin/python -m pytest -m 'not tpu' \
   tests/test_stale_rollout.py tests/test_rollout_batch_audit.py
 ```
 
-ICI 权重同步、BF16 转换与分块保存已在四芯片 TPU v4 上通过 59 项数组检查，覆盖传输内容、浮点转换、分片方式、保存字节和失败条件。这些检查不加载 E2B，运行方法如下：
+ICI weight synchronization, BF16 conversion, and chunked checkpoint writes have passed 59 array checks on four TPU v4 chips. These cover transferred contents, floating-point conversion, sharding, saved bytes, and failure conditions. They do not load E2B. Run them with:
 
 ```bash
 JAX_PLATFORMS=tpu,cpu .venv/bin/python -m pytest \
   tests/test_inference_device.py tests/test_checkpoint_chunks.py
 ```
 
-完整 E2B 训练、保存与独立续训应另外运行前面的恢复示例或完整实验。已有历史实验不自动覆盖迁移后的代码，尤其非零 KL 的训练需要按当前数学实现重新验证。
+Full E2B training, checkpointing, and recovery in a separate process require the recovery example or complete experiment above. Historical experiments do not automatically validate the reorganized public code, particularly nonzero-KL training, which needs verification against the current mathematical implementation.

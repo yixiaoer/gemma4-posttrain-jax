@@ -1,128 +1,118 @@
-# GRPO 及相关算法全解析：从回答的奖励到模型参数更新
+# GRPO and related algorithms: from response rewards to parameter updates
 
+**English** | [简体中文](grpo-and-related-algorithms.zh-CN.md)
 
-监督微调（Supervised Fine-Tuning，SFT）依赖于"问题＋标准答案"的训练数据。训练时，模型对固定的目标文本做前向计算，逐 token 预测下一个未知的内容。如果该领域已有高质量数据以及对应 groundtruth，这种做法非常直接。
+Supervised fine-tuning (SFT) trains on questions paired with target answers. The model runs a forward pass on fixed text and learns to predict each next token. This is straightforward when a domain already has high-quality examples and ground truth.
 
-然而在有些任务中，判断一个回答是否正确远比写出完整的解答过程容易，比如在数学推导中，一道题检查最终答案是否等于 42 几乎没有成本，但要写出完整的推导步骤则需要实际的人力，而且无论写多少条，SFT 的直接监督信号仍来自这些已有解答；模型可以泛化出新解法，但训练目标本身不评价它新生成的推导是否正确。
+For some tasks, however, checking an answer is much easier than writing a complete solution. In mathematics, checking whether the final answer is 42 can cost almost nothing, while writing all the reasoning steps takes human effort. Regardless of how many examples are written, SFT receives its direct supervision from those existing solutions. The model can generalize to new solutions, but the training objective itself does not evaluate the correctness of newly generated reasoning.
 
-强化学习（Reinforcement Learning，RL）给出了另一种解决思路：让模型自行生成多条回答，由评估器给出对回答的评价（奖励），再根据奖励反向调整模型参数。训练样本不再是事先写好的文本和对应标签，而是模型自己的生成结果；训练信号来自奖励。本仓库的数学实验仍使用题目对应的标准答案评分，只是不要求预先提供每条训练回答的完整推导。
+Reinforcement learning (RL) takes a different approach: the model generates several responses, an evaluator assigns rewards, and those rewards guide parameter updates. The training samples are the model's own outputs, with rewards providing the learning signal. This project's mathematical experiments still score responses against reference answers; they do not require a complete worked solution for every training response.
 
-GRPO（Group Relative Policy Optimization，组相对策略优化）的核心思路是：为同一道题生成多条回答，在组内比较它们的奖励，据此判断哪些回答值得提高概率。本文会沿着训练的完整计算顺序展开：从奖励怎样变成 advantage，到 loss 的各个部分（概率比裁剪、KL 正则、mask 与长度归一化），再到反向传播和优化器更新模型参数，拆解GRPO的完整计算过程，并横向对比 Dr. GRPO、DAPO、GSPO 与 RLOO 等相关算法的具体改进点。
+Group Relative Policy Optimization (GRPO) generates several responses to the same question and compares rewards within that group to decide which responses should become more probable. This document follows the complete calculation: rewards become advantages; probability-ratio clipping, KL regularization, masks, and length normalization define the loss; backpropagation and the optimizer update the parameters. It also explains the specific changes made by Dr. GRPO, DAPO, GSPO, and RLOO.
 
-## 1. 从模仿答案到利用奖励
+## 1. From imitating answers to learning from rewards
 
-
-设 $`x`$ 为输入问题，$`y`$ 为长度为 $`L`$ 的回答，$`\theta`$ 为模型参数。模型在每个位置 $`t`$ 根据问题和前面已有的回答内容预测下一个 token，因此整条回答的生成概率是各位置条件概率的连乘：
+Let $`x`$ be a question, $`y`$ a response of length $`L`$, and $`\theta`$ the model parameters. At position $`t`$, the model predicts the next token from the question and preceding response tokens. The probability of the full response is therefore the product of these conditional probabilities:
 
 ```math
 \pi_\theta(y\mid x)=\prod_{t=1}^{L}\pi_\theta(y_t\mid x,y_{\lt t})
 ```
 
-实际计算时取对数概率（log-probability，简称 logprob），把乘积变成求和：
+Taking log-probabilities, or logprobs, turns the product into a sum:
 
 ```math
 \log\pi_\theta(y\mid x)=\sum_{t=1}^{L}\log\pi_\theta(y_t\mid x,y_{\lt t})
 ```
 
-**SFT 的做法**是直接最小化固定目标的负 logprob，模型对这条文本做前向计算，求梯度，更新参数。
+**SFT** minimizes the negative logprob of a fixed target: run the forward pass, compute gradients, and update parameters.
 
-**强化学习的做法**则是最大化回答的期望奖励：
+**RL** aims to maximize expected response reward:
 
 ```math
 J(\theta)=\mathbb E_x\mathbb E_{y\sim\pi_\theta(\cdot\mid x)}[R(x,y)]
 ```
 
+Two parts are not differentiable here. Sampling a token is a discrete operation, and a reward function $`R(x,y)`$, such as a rule-based final-answer checker, is also non-differentiable.
 
-
-
-但此处有两个东西没法求导：从概率分布中抽取 token 是离散操作，而奖励函数 $`R(x,y)`$ （比如比对最终答案是否正确的规则验证器），也是不可导的。
-
-这里利用策略梯度恒等式 $`\nabla\pi = \pi\nabla\log\pi`$，可以把期望奖励的梯度推导为：
+The policy-gradient identity $`\nabla\pi = \pi\nabla\log\pi`$ gives:
 
 ```math
 \nabla_\theta J=\mathbb E_x\mathbb E_{y\sim\pi_\theta(\cdot\mid x)}[R(x,y)\nabla_\theta\log\pi_\theta(y\mid x)]
 ```
 
+The expectation $`E_{y\sim\pi_\theta(\cdot\mid x)}`$ requires sampling from the current model. After generation, the response $`y`$ is fixed, and $`R(x,y)`$ is a scalar. To compute the gradient, feed those generated tokens back through the model, just as in SFT, and calculate their logprobs. That forward pass is differentiable with respect to the parameters. Reward $`R`$ acts as a scalar multiplier on the gradient; neither the sampler nor the verifier participates in backpropagation.
 
-根据这个恒等式，期望 $`E_{y\sim\pi_\theta(\cdot\mid x)}`$ 要求从当前模型采样，即用当前模型 generate 得到若干条具体的文本。采样完成后，生成的文本 $`y`$ 被确定，则 $`R(x,y)`$ 变成确定的标量。然后计算梯度：把已经生成好的文本喂回模型做一次前向计算，这和 SFT 完全一样，得到这些 token 的 logprob，而这个前向计算对模型参数可导。这样一来，奖励 $`R`$ 只是乘在梯度前面的标量系数，采样过程和验证器都不参与反向传播，绕开了前面说的没法求导的问题。
+This direct estimator can have high variance. Subtracting a suitable baseline from rewards is a common way to reduce it. GRPO builds its baseline from all responses to the same question, including the response being scored, and adds standardization, probability-ratio clipping, and length normalization. These choices change the actual objective from the simple expression above. The following sections examine each one.
 
-但直接使用这个公式方差很大，为了降低梯度估计的方差，通常需要让奖励减去一个合理的基准（Baseline）。GRPO 把同题内的全部回答（包括当前回答）放在一起构建基准，并进一步引入了标准化、概率比裁剪和按长度归一化等设计。加完之后实际优化的目标已经不是上面那个简单公式了，后面逐一介绍。
+## 2. Compute advantages within a group
 
+In classical RL, the advantage $`A`$ measures how much the expected cumulative return of an action exceeds the baseline for its state, usually written as $`A^\pi(s,a)=Q^\pi(s,a)-V^\pi(s)`$. It concerns cumulative return, not just the immediate reward:
 
+- $`A \gt  0`$: the action is better than the baseline, so its probability should increase.
+- $`A \lt  0`$: the action is worse than the baseline, so its probability should decrease.
 
-## 2. 组内相对优势计算（Advantage）
+The baseline supplies a reference level. It might be a learned value function or a moving average of past rewards.
 
-在经典强化学习中，优势估计（Advantage，记为 $`A`$）衡量的是在某个状态下选择一个动作的预期累计回报，比该状态的基准（Baseline）高多少，通常写作 $`A^\pi(s,a)=Q^\pi(s,a)-V^\pi(s)`$；它不只是比较当前一步的即时奖励：
-
-- $`A \gt  0`$：该动作优于基准，希望提高其概率
-- $`A \lt  0`$：该动作劣于基准，希望降低其概率
-
-这里基准提供了平均水平的参照，具体可以是学习出来的价值函数（value）、历史奖励的移动平均等。
-
-GRPO 中，一个"动作"就是对一道题生成的一条完整回答。GRPO 为同一道题生成 $`G`$ 条回答，这 $`G`$ 条回答构成一个组（Group，也是算法名称的由来）。GRPO 不训练价值网络，而是用组内所有回答的均值和标准差来构建基准。
+For GRPO here, an action is a complete response. The model generates $`G`$ responses to each question, forming a group. GRPO does not train a value network; it centers and scales rewards using the group's mean and standard deviation:
 
 ```math
 A_i=\frac{R_i-\bar R}{s_R+\varepsilon}
 ```
 
-其中组内均值 $`\bar R=\frac1G\sum_{i=1}^G R_i`$，标准差$`s_R=\sqrt{\frac1{G-1}\sum_{i=1}^G(R_i-\bar R)^2}`$，$`\varepsilon=10^{-6}`$。
+The group mean is $`\bar R=\frac1G\sum_{i=1}^G R_i`$, the standard deviation is $`s_R=\sqrt{\frac1{G-1}\sum_{i=1}^G(R_i-\bar R)^2}`$, and $`\varepsilon=10^{-6}`$.
 
+For example, four responses with rewards `[1, 1, 0, 0]` have mean $`\bar{R}=(1+1+0+0)/4=0.5`$ and sample standard deviation $`s_R\approx 0.57735`$. Their advantages are approximately $`A\approx[0.866, 0.866, -0.866, -0.866]`$. These values weight the gradients; the eventual probability changes also depend on the learning rate, optimizer state, and other factors.
 
-举一个具体例子：假设同一道题生成了 4 条回答，奖励为 `[1, 1, 0, 0]`。均值 $`\bar{R}=(1+1+0+0)/4=0.5`$，样本标准差 $`s_R\approx 0.57735`$，代入公式得到 advantage $`A\approx[0.866, 0.866, -0.866, -0.866]`$。这些 Advantage 数值是乘在梯度前面的权重，最终概率变化还取决于学习率、优化器状态等因素。另外，奖励是针对整条回答的一个分数（比如"答对了"得 1 分），所以同一条回答里的每个 token 都乘以同一个 $`A_i`$。如果一条回答在第 50 步推导出错，前面正确的 49 步也会被同样对待，整条回答一个分数，无法区分到哪一步出了问题。
+Reward is a single score for the whole response, such as 1 for a correct answer, so every token in a response receives the same $`A_i`$. If reasoning goes wrong at step 50, the preceding 49 correct steps receive the same weight. One response-level score cannot identify where the error occurred.
 
-
-[losses.py](../gemma4_posttrain_jax/losses.py) 中 `compute_advantages` 的核心实现：
+The core of `compute_advantages` in [losses.py](../gemma4_posttrain_jax/losses.py) is:
 
 ```python
 grouped = rewards.astype(jnp.float32).reshape(-1, group_size)
-shifted = grouped - grouped[:, :1]  # 把每组的每个奖励都减去该组第一个奖励
+shifted = grouped - grouped[:, :1]  # Subtract the first reward from every reward in each group.
 centered = shifted - shifted.mean(axis=-1, keepdims=True)
 advantages = centered / (shifted.std(axis=-1, ddof=1, keepdims=True) + 1e-6)
 ```
 
+`reshape` groups every $`G`$ rewards together, requiring responses to the same question to occupy consecutive array positions. `ddof=1` uses $`G-1`$ in the standard-deviation denominator rather than $`G`$.
 
-* reshape 把奖励按每 $`G`$ 条一组排列，要求同题回答在数组中连续存放。
+The intermediate `shifted = grouped - grouped[:, :1]` subtracts the first reward from every reward in its group. This extra step improves floating-point stability; it is not required by the mathematical formula.
 
-* `shifted = grouped - grouped[:, :1]` 把每组的所有奖励减去该组第一项
-    * 这不是公式要求的步骤，而是为了浮点数值稳定性额外加的操作
-    * 当一组回答的奖励完全相同时，比如全部为 `0.1`
-        * advantage 应该全部为零，因为没有任何一条比其他的好。
-        * 但 0.1 在二进制浮点数里无法精确表示，在某些后端和归约顺序下，64 个 FP32 的 0.1 求和再取均值，可能不等于原来存储的那个 FP32 数值。两者相减就留下极小的残差，再除以接近 $`10^{-6}`$ 的分母（标准差加上 $`\varepsilon`$），会被放大成看起来有意义的数，但其实是浮点误差。
-        * 在这种情况下，先把每个值减去组内第一项：0.1 − 0.1。因为是同一个浮点数减自己，结果在位级别上精确为 0。之后对一组全零的数求均值和标准差，结果都精确为零，advantage 也精确为零。
-        * 上面讨论的只是 advantage 这一项梯度。即使 advantage 成功归零，模型参数也不一定就不动，因为 KL 正则项仍可能提供梯度，而 Adam 优化器里之前积累的动量也可能继续影响参数更新，后面会有专门的章节解释。
-    * [对应测试](../tests/test_grpo.py)检查不同组大小下的常量奖励是否得到精确为零的 advantage。
-* `ddof=1` 对应公式中除以 $`G-1`$，而非 $`G`$。
+Consider a group in which all rewards equal `0.1`. Every advantage should be zero because no response is better than another. But 0.1 has no exact binary floating-point representation. Depending on the backend and reduction order, averaging 64 FP32 copies of 0.1 may not reproduce the stored FP32 value exactly. Subtraction can leave a small residual, which division by a denominator near $`10^{-6}`$ amplifies into an apparently meaningful advantage.
 
+Subtracting the first value first makes each entry 0.1 − 0.1, exactly zero at the bit level. The mean and standard deviation of these zeros are also exactly zero, giving exactly zero advantages. The [tests](../tests/test_grpo.py) check constant rewards across different group sizes.
 
+This only addresses the advantage contribution to the gradient. Zero advantages do not guarantee unchanged parameters: KL can still contribute gradients, and Adam's accumulated momentum can still produce updates, as discussed below.
 
-## 3. Old Policy 与概率比裁剪（Probability Ratio Clipping）
+## 3. Old policy and probability-ratio clipping
 
-### 为什么需要 Old Policy
+### Why keep an old policy?
 
-Rollout（用生成策略采样完整回答）通常是 RL 训练的主要开销之一：需要逐 token 生成，而推理任务的回答往往又比较长。它与一次训练更新的耗时关系取决于长度、批大小和实现。因此对于采样生成的本batch回答，在实践中常常复用 $`\mu`$ 次来更新模型。
+Rollout, which samples complete responses from a generation policy, is often a major RL training cost. It generates tokens sequentially, and reasoning responses can be long. Its cost relative to an update depends on sequence length, batch size, and implementation. In practice, a generated batch is therefore often reused for $`\mu`$ parameter updates.
 
-但这就带来一个问题：第一次更新之后，模型参数已经变了，而回答仍然是更新前的模型生成的。后续每次更新时，我们需要知道当前模型给这些 token 的概率相比训练开始时偏移了多少，偏移过大则需要限制更新幅度。旧策略（Old Policy）就是在本batch训练开始时记录下来的概率，后续更新都拿它作参照。
+After the first update, however, the parameters have changed while the responses still come from the earlier model. Later updates need a reference for how far the current token probabilities have moved. The old policy records probabilities at the start of training on this batch and remains fixed throughout its updates.
 
-Old Policy 在本batch开始训练时固定下来。对第 $`i`$ 条回答的第 $`t`$ 个 token，概率比（Probability Ratio，记为 $`r`$）定义为：
+For token $`t`$ of response $`i`$, define the probability ratio $`r`$ as:
 
 ```math
 r_{i,t}(\theta)=\frac{\pi_\theta(y_{i,t}\mid x_i,y_{i,\lt t})}{\pi_{old}(y_{i,t}\mid x_i,y_{i,\lt t})}=\exp(\ell_{i,t}-\ell^{old}_{i,t})
 ```
 
-其中 $`\ell`$ 为当前 logprob，$`\ell^{old}`$ 为旧策略 logprob。$`r=1.1`$ 意味着这个 token 的条件概率比基准高了 10%。当前实现使用的是逐 token 的概率比，在每个位置 $`t`$，分别算当前模型和旧模型在该位置的条件概率，然后相除；并非整条回答概率的乘积。
+Here $`\ell`$ is the current logprob and $`\ell^{old}`$ the old logprob. $`r=1.1`$ means that the token's conditional probability is 10% higher than the baseline. This implementation uses a ratio at each token position $`t`$, not a product over the entire response.
 
-### 怎样限制目标对概率变化的激励：PPO clipping
-概率比 $`r`$ 衡量的是当前模型相对旧模型的偏移，如果不加限制，优化器可能在一次更新中把某些 token 的概率推得很远。近端策略优化（Proximal Policy Optimization，PPO）的 clipping（裁剪）方法通过截断这个比值 $`r`$，设定目标中的裁剪区间（比如 $`[0.8,1.2]`$）。当概率已沿 advantage 指示的方向越过相应边界时，目标不再鼓励继续朝该方向变化；它不是所有区间外位置都停止提供梯度。最小化的策略损失为：
+### PPO clipping limits the objective's incentive
+
+The ratio $`r`$ measures movement relative to the old policy. Without a constraint, an optimizer can move some token probabilities substantially in one update. Proximal Policy Optimization (PPO) clips the ratio within an interval such as $`[0.8,1.2]`$. Once the probability has crossed the relevant boundary in the direction favored by the advantage, the objective stops rewarding further movement in that direction. This does not remove gradients at every position outside the interval. The policy loss to minimize is:
 
 ```math
 \mathcal L^{policy}_{i,t}=-\min\left(r_{i,t}A_i,\;\mathrm{clip}(r_{i,t},1-\epsilon_l,1+\epsilon_h)A_i\right)
 ```
 
-代入具体数值帮助理解 `min` 的作用：以正优势 $`A=1`$ 为例，当 $`r`$ 从 $`1.0`$ 增长到 $`1.1`$ 时，目标如实奖励这种变化；但当 $`r`$ 已经超过 $`1.2`$（即 $`1+\epsilon_h`$），继续增加也不会进一步减小 loss 了。对于负优势，则形成对概率过度下降的下界保护。clipping 不是把所有超出区间的梯度都设为零，梯度的方向取决于 $`A`$ 的符号。
+For positive advantage $`A=1`$, increasing $`r`$ from $`1.0`$ to $`1.1`$ improves the objective. Once $`r`$ exceeds $`1.2`$, or $`1+\epsilon_h`$, further increases no longer reduce the loss. Negative advantages produce the corresponding lower-bound protection against excessive probability decreases. The sign of $`A`$ determines which direction is clipped.
 
-### 代码中的两次 clip
+### The two clips in the code
 
-`grpo_loss` 将最大化目标改写成供优化器最小化的 loss。以下片段展示了每条回答一个 advantage 的情形：
+`grpo_loss` expresses the maximization objective as a loss for the optimizer to minimize. For one advantage per response:
 
 ```python
 old = lax.stop_gradient(policy) if old_logps is None else old_logps.astype(jnp.float32)
@@ -134,104 +124,93 @@ clipped = -advantage * jnp.clip(ratio, 1.0 - eps_low, 1.0 + eps_high)
 per_token_policy = jnp.maximum(unclipped, clipped)
 ```
 
-代码中有两次 `clip` 操作，作用完全不同：
+The two `clip` calls have different purposes:
 
-1. **第 1 次**作用于 `log_ratio`，区间为 `[-20, 20]`，目的是限制指数计算的输入范围、防止数值溢出；
-2. **第 2 次**作用于 `ratio`，区间为 `[1-eps_low, 1+eps_high]`，才是算法层面的 PPO 概率比裁剪。
+1. `log_ratio` is clipped to `[-20, 20]` to bound the exponential's input and prevent numerical overflow.
+2. `ratio` is clipped to `[1-eps_low, 1+eps_high]` for the algorithm's PPO objective.
 
-两者的区间、目的和对梯度的影响各不相同。
+Their ranges, purposes, and effects on gradients are distinct.
 
-### Loss 为零不代表梯度为零
+### Zero loss does not imply zero gradient
 
-`stop_gradient` 保留数值但阻止沿该路径求导。首次更新时使用当前 logprob 的停止求导副本作为 old，这样 $`r`$ 的数值恰好为 1，但对当前 logprob 的导数仍然为 1。即使正负 advantage 恰好抵消使得平均 loss 为零，各个位置的梯度也不为零。
+`stop_gradient` preserves a value while blocking differentiation through that path. On the first update, a stopped-gradient copy of the current logprob serves as Old. The ratio $`r`$ is exactly 1, but its derivative with respect to the current logprob is still 1. Positive and negative advantages can cancel in the mean loss while leaving nonzero gradients at individual positions.
 
-在上面四条回答、每条两个 token 的例子中，正 advantage 回答每个 logprob 的梯度约为 $`-0.108253`$，负 advantage 回答则符号相反。[GRPO 测试](../tests/test_grpo.py)进一步检查了 ratio 为 1 时的非零梯度与小模型更新。
+In the four-response example above, with two tokens per response, each logprob in a positive-advantage response has a gradient of about $`-0.108253`$; negative-advantage responses have the opposite sign. The [GRPO tests](../tests/test_grpo.py) check nonzero gradients at a ratio of 1 and updates in a small model.
 
-另外需要注意：概率比裁剪不是对最终概率的硬约束。其他位置通过共享参数产生的梯度，以及 Adam 的历史动量，都可能让更新后的 $`r`$ 超出裁剪区间。因此需要分别观察目标值、梯度和实际参数变化，不能只看其中一个。
+Clipping is also not a hard bound on probabilities after an update. Gradients from other positions through shared parameters, together with Adam's historical momentum, can move the resulting $`r`$ outside the interval. Objective values, gradients, and actual parameter changes therefore need separate inspection.
 
+## 4. Policy distributions and probability sources
 
-## 4. 区分策略分布与概率来源
+Several logprob arrays in the training code have similar names. Their origins determine how to interpret the objective.
 
-训练代码中有几组名字相似的 logprob，搞清楚它们各自的来源才能正确理解训练目标。
+Consider the default synchronous workflow, starting RL from an SFT model $`\theta_0`$.
 
-举例说明，下面先考虑默认的同步采样流程，假设 RL 训练开始之前有一个 SFT 过的模型 $`\theta_0`$。
+The **Reference Policy** is a frozen copy of $`\theta_0`$. Its parameters never change during training. It provides the fixed anchor used by KL regularization.
 
-**Reference Policy（参考策略）** 就是 $`\theta_0`$ 的一份冻结拷贝。从训练开始到结束，其参数永远不动，唯一作用是提供一个"别偏离太远"的锚点，后面 KL 正则项那节会用到它。
+After 100 updates, the parameters are $`\theta_{100}`$. A new batch begins with the **Behavior Policy**, $`\theta_{100}`$, generating responses. Those responses remain fixed throughout training on the batch.
 
-训练进行了一段时间，模型参数变成了 $`\theta_{100}`$（已经更新了 100 步）。现在要开始新一个 batch 的训练：
+The first training forward pass uses the same $`\theta_{100}`$ to recompute logprobs for the fixed responses. These become the **Old Policy** probabilities, held constant as the denominator of $`r`$ throughout the $`\mu`$ updates.
 
-**Behavior Policy（行为策略）** 就是 $`\theta_{100}`$，用它跑 rollout 生成一个 batch 的回答，生成完成后这批回答就固定了，后面不管模型怎么变，回答不会重新生成。
+Behavior and Old use the same parameters here, but their logprobs can differ. Generation decodes with a KV cache one token at a time; training processes the full sequence in parallel. Different floating-point operation orders explain why this code captures Old from the first training forward pass rather than reusing generation logprobs.
 
-接下来进入训练循环。第一次前向计算时，用同一个 $`\theta_{100}`$ 对这 batch 固定回答重新算一遍 logprob 并记录下来，这就是 **Old Policy（旧策略）**。后续 $`\mu`$ 次更新中，Old Policy 不再变化，始终作为概率比 $`r`$ 的分母。
+No additional complete Old model is needed. For fixed responses, storing their token-level `old_logps` is sufficient. This implementation captures them during the first actual gradient forward pass and keeps only the FP32 `[batch, completion_length]` array. If parameters, context, and probability computation match, Old and Behavior can share one logprob array; the names describe their sources, not an algorithmic prohibition on sharing. Keeping both records here lets us measure changes during training separately from differences introduced by generation, including native JAX rollout.
 
-Behavior Policy 和 Old Policy 来自同一份参数 $`\theta_{100}`$，但 logprob 的数值可能不同：生成时用 KV Cache 逐 token 解码，训练时用整条序列并行前向，浮点计算顺序不同。因此代码使用首次训练前向中计算的 logprob 作为 Old Policy，而不是直接复用 generate 时记录的 logprob。
+The $`\mu`$ updates then produce $`\theta_{101}`$, $`\theta_{102}`$, and so on. Logprobs recomputed with the parameters for each update are the **Current Policy** probabilities. These are the differentiable values and change with each update. Old remains the record from $`\theta_{100}`$; the ratio is Current divided by Old.
 
-这并不要求额外保存一整份 Old 模型。对已经生成的固定回答，保存对应 token 的 `old_logps` 就足够了；本实现从第一次实际梯度前向中捕获它，之后只保留这个 `[batch, completion_length]` 的 FP32 数组。若参数、上下文与概率计算一致，Old 和 Behavior 可以复用同一份 logprob；区分两个名字是为了表达来源，不是算法禁止共享。当前保留两份概率记录，是为了分别衡量训练中的策略变化和生成路径的概率差异，也适用于原生 JAX rollout。
+After all $`\mu`$ updates, the latest model generates the next batch. Behavior changes to that model, and Old is captured again. Reference stays fixed throughout. With sequential stale rollout, Behavior can come from an earlier parameter version while Old is still captured from the batch's first training pass. In that case their parameter versions, as well as their computation paths, differ.
 
-
-
-然后开始 $`\mu`$ 次更新。第一次更新后模型变成 $`\theta_{101}`$，第二次变成 $`\theta_{102}`$……每次更新时用当前参数重新算出来的 logprob 就是 **Current Policy（当前策略）**。它是唯一参与求导的量，每次更新都在变。而 Old Policy 始终是 $`\theta_{100}`$ 时记录的那份，不变。概率比 $`r`$ 就是 Current 除以 Old。
-
-整个 $`\mu`$ 次更新结束后，再用最新的模型跑下一个 batch 的 rollout，Behavior Policy 变成新的模型，Old Policy 也重新捕获，如此循环。Reference Policy 自始至终不动。若启用顺序滞后的 rollout 配置，Behavior Policy 可以来自较早的参数版本，而 Old Policy 仍从本批第一次训练计算中捕获；两者此时不仅计算方式不同，参数版本也不同。
-
-总结：
-
-| 名称 | 来源与作用 |
+| Name | Source and role |
 |---|---|
-| **Reference Policy** | 全局固定，训练开始时冻结，永不更新 |
-| **Behavior Policy** | 实际生成本 batch 回答的模型；同步流程中是当前模型，也可以是显式保存的较旧策略 |
-| **Old Policy** | 每个 batch 第一次训练前向时捕获，$`\mu`$ 次更新中保持不变 |
-| **Current Policy** | 每次梯度更新后都在变，是求导的对象 |
+| **Reference Policy** | Frozen at the start of training and never updated |
+| **Behavior Policy** | The model that actually generated this batch; the current model in synchronous training, or an explicitly retained older policy |
+| **Old Policy** | Captured during the first training forward pass for each batch and fixed across its $`\mu`$ updates |
+| **Current Policy** | Changes after each gradient update and supplies the differentiable probabilities |
 
-### 原始策略分布与实际采样分布
+### Raw policy and actual sampling distributions
 
-还需要区分 raw policy distribution（原始策略分布）与 proposal distribution（实际采样分布）。温度、TopK、Top-p 都会改变选择 token 的分布。原生生成器的 `rollout_logps` 记录的是原始完整词表的概率，没有单独的 proposal logprob 字段。当前 RL 入口固定使用温度 1 和完整词表采样；生成 CLI 开放的截断采样选项不能直接照搬进训练而忽略采样修正。
+The raw policy distribution can differ from the proposal distribution used to sample. Temperature, top-k, and top-p change the distribution over selected tokens. The native generator's `rollout_logps` records raw full-vocabulary probabilities; there is no separate proposal-logprob field. The current RL entry point uses temperature 1 and full-vocabulary sampling. Truncated-sampling options from the generation CLI cannot simply be copied into training without addressing the sampling correction.
 
-若启用截断重要性采样（Truncated Importance Sampling，TIS），权重作为固定系数作用于策略目标，不乘独立的 KL 项。行为策略的参数版本、实际采样方式和概率字段必须一起对应，单靠一个名叫 `logprob` 的数组不足以确定它的含义。
+When Truncated Importance Sampling (TIS) is enabled, its weights act as fixed coefficients on the policy objective, not on the separate KL term. The behavior policy's parameter version, actual sampling method, and probability fields must agree. An array named `logprob` alone does not establish its meaning.
 
+## 5. KL regularization
 
+### Why use KL divergence?
 
-## 5. KL 正则项约束
+Reward alone can encourage undesirable behavior: always using one response format, losing linguistic diversity, or exploiting a verifier to earn high scores for meaningless answers. A KL-divergence penalty measures departure from a fixed reference model and can reduce this drift. It does not guarantee that reward exploitation or mode collapse disappears. The project also permits $`\beta=0`$, which disables this term. The reference model is the frozen Reference Policy from Section 4.
 
-### 为什么需要 KL 散度
-
-RL 训练只看奖励信号。如果不加限制，模型可能为了拿高分而走极端，比如只输出一种固定格式的回答、丢掉语言的多样性，甚至在验证器上找到漏洞拿高分但回答实际上没意义。为了减轻这种偏离，可以在训练目标中加入惩罚项：用 KL 散度（Kullback–Leibler Divergence）衡量当前模型和固定参考模型的分布差异。它不能保证消除奖励漏洞或模式退化，而且本仓库允许 $`\beta=0`$，不启用这一项。这里的参考模型就是第 4 节中的 Reference Policy，全程不动。
-
-直接算两个分布的 KL 散度需要对整个词表求和，计算代价很高。本仓库默认采用名为 $`K_3`$ 的估计式，只需要当前 token 位置上的两个 logprob 就能给出一个估计值。令对数差值 $`d = \log\pi_{ref} - \log\pi_\theta`$（参考模型的 logprob 减去当前模型的 logprob）：
+Computing exact KL requires summing over the full vocabulary. This implementation uses the $`K_3`$ estimator, which needs only two logprobs at the sampled token. Let $`d = \log\pi_{ref} - \log\pi_\theta`$, the reference logprob minus the current logprob:
 
 ```math
 k_3(d)=e^d-1-d
 ```
 
-当 $`d = 0`$，即两个模型在该 token 上概率相同时 $`k_3=e^0-1-0=0`$ ，没有惩罚。 $`d`$ 越偏离零，$`k_3`$越大惩罚越重。对于上面未加上限的公式，在固定上下文下，若 token 来自当前策略 $`\pi_\theta`$，两者具有相同的支持集且相关期望有限，则 $`k_3`$ 的期望等于 $`\mathrm{KL}(\pi_\theta\|\pi_{ref})`$。本仓库复用旧回答时，使用的是这些样本上的正则估计值，不能将其 batch 均值直接视作当前策略下的精确 KL。
+When $`d = 0`$, the two models assign the same token probability and $`k_3=e^0-1-0=0`$. The penalty grows as $`d`$ moves away from zero. For this uncapped formula at a fixed context, if tokens are sampled from the current policy $`\pi_\theta`$, both policies have the same support, and the relevant expectations are finite, the expectation of $`k_3`$ equals $`\mathrm{KL}(\pi_\theta\|\pi_{ref})`$. When reusing old responses, this project computes a regularizer on those samples; their batch mean is not the exact KL under the current policy.
 
-这个值加到每个 token 的 loss 上，由系数$`\beta`$ 控制惩罚力度：
+The coefficient $`\beta`$ controls how strongly this term contributes to each token's loss:
 
 ```math
 \mathcal L=\mathcal L^{policy}+\beta\mathcal L^{KL}
 ```
 
+### Numerical stability
 
-### 数值稳定性
+Even the short expression $`k_3(d)=e^d-1-d`$ requires care. Near zero, subtraction can lose significant digits. For large positive $`d`$, $`e^d`$ can dominate the update. The implementation uses a numerically stable piecewise calculation and treats the optional cap as a separate configuration. Improving numerical accuracy and capping the objective address different issues. The [KL numerical tests](../tests/test_kl_numerics.py) check values and gradients near zero, and finite results for larger differences.
 
-$`k_3(d)=e^d-1-d`$这个看似简短的公式也影响实现上的选择。$`d`$ 接近零时，直接相减可能丢失有效数字；$`d`$ 很大时，指数项 $`e^d`$ 可能主导整个更新。仓库采用了分段稳定的计算方式，并将可选上限视为独立的配置项，提高计算精度与改变目标上限解决的是不同层面的问题。[KL 数值测试](../tests/test_kl_numerics.py)分别检查接近零时的函数值、梯度以及较大差值下的有限性。
+## 6. Masks, length normalization, and microbatches
 
+### Which positions contribute to the loss?
 
-## 6. Mask、长度归一化与 Microbatch
+The forward pass processes the prompt and generated response as one sequence. Training uses the response logprobs weighted by the advantage. A loss mask excludes prompt positions and padding after EOS while retaining valid response tokens. To exclude a truncated response, zero its entire loss-mask row. The real prompt must remain available because the forward computation still needs the correct context.
 
-### 哪些位置计入 Loss
+### How reduction changes the objective
 
-训练时 prompt 和模型生成的回答拼成一条序列做前向计算，模型会对每个位置都输出预测，但我们只需要回答部分的 logprob 乘以 advantage 来产生梯度，prompt 部分不应该计入。Loss mask（掩码）就是用来标记哪些位置的 logprob 参与 loss 计算的：prompt 位置和 EOS 之后的 padding 位置标记为零，只保留回答区间内的有效 token。如果某条回答超长需要过滤，将其整行 mask 置零即可，不需要替换 prompt 内容，因为模型前向计算仍然需要读取真实的上下文。
-
-### 聚合方式的影响
-
-GRPO 的损失聚合方式是先在每条回答内按有效 token 数求平均，再对所有非空回答求平均。设 $`M_{i,t}`$ 为掩码标识，$`L_i`$ 为有效 token 长度，$`B_{valid}`$ 为非空回答总数：
+GRPO first averages over valid tokens within each response, then averages over nonempty responses. Let $`M_{i,t}`$ be the mask, $`L_i`$ the valid token count, and $`B_{valid}`$ the number of nonempty responses:
 
 ```math
 \mathcal L=\frac1{B_{valid}}\sum_{i:L_i\gt 0}\frac1{L_i}\sum_t M_{i,t}\left(\mathcal L^{policy}_{i,t}+\beta k_{3,i,t}\right)
 ```
 
-`aggregate_token_loss` 中对应的代码：
+The corresponding code in `aggregate_token_loss` is:
 
 ```python
 row_tokens = mask.sum(axis=-1)
@@ -240,20 +219,19 @@ row_loss = (values * mask).sum(axis=-1) / jnp.maximum(row_tokens, 1)
 return row_loss.sum() / nonempty_rows
 ```
 
-求和与求平均的选择属于归约（Reduction）方式，它们决定每个 token 对最终梯度的实际权重。用一个具体例子说明差异：假设两条回答的 token loss 分别为 `[1, 1]` 和 `[3]`。先按回答平均得到 $`(1+3)/2=2`$；直接对三个 token 取平均则得到 $`(1+1+3)/3=5/3`$。前者让两条回答的总权重相同，后者让每个有效 token 的权重相同。
+These reduction choices determine each token's effective weight in the gradient. Suppose two responses have token losses `[1, 1]` and `[3]`. Averaging within each response and then across responses gives $`(1+3)/2=2`$. Averaging all three tokens gives $`(1+1+3)/3=5/3`$. The first gives each response equal total weight; the second gives each valid token equal weight.
 
-### Microbatch 的梯度累积规则
+### Gradient accumulation across microbatches
 
-Microbatch（微批次）是为了控制显存占用而从完整 batch 中拆出的较小批次。拆分必须保持全局数学等价性：先在完整的同题组上算好 advantage，再拆分回答行求梯度，按正确的分母加权累积，最后执行一次优化器更新。
+A microbatch is a smaller portion of the full batch used to reduce device memory use. Splitting must preserve the global objective: compute advantages over complete question groups first, split response rows for gradient computation, accumulate with the correct denominator weights, and perform one optimizer update at the end.
 
-继续上面的例子，这里专门考察全部有效 token 平均的目标，而不是 GRPO 默认的按回答平均；后者应按非空回答数加权。如果把两条回答分进两个 microbatch，它们的 token 均值分别是 1 和 3。直接对这两个均值取平均会错误地得到 2，而按有效 token 数以 $`2/3`$ 和 $`1/3`$ 加权才能得到正确的 $`5/3`$。实际 `grpo_train_step` 在 `lax.scan` 中累积梯度，循环结束后才调用优化器。
+For the example above, consider the objective that averages over all valid tokens. This is distinct from default GRPO, which weights by nonempty response counts. Put the two responses in separate microbatches: their token means are 1 and 3. Equally averaging those means incorrectly gives 2. Weighting them by valid token counts, $`2/3`$ and $`1/3`$, recovers $`5/3`$. `grpo_train_step` accumulates gradients inside `lax.scan` and calls the optimizer only after the loop.
 
+## 7. From logprob gradients to parameter changes
 
-## 7. 从 Logprob 梯度到参数变化
+### Backpropagation
 
-### 反向传播流程
-
-训练函数将问题与固定回答拼接，计算回答位置上实际 token 的 logprob，然后构造标量 loss。`jax.value_and_grad` 沿模型的前向和反向传播路径，得到模型参数的梯度。以下是 `grpo_train_step` 的调用关系（省略号代表配置参数）：
+The training function concatenates prompts and fixed responses, computes the logprobs of the actual response tokens, and constructs a scalar loss. `jax.value_and_grad` differentiates through the model to obtain parameter gradients. The call structure in `grpo_train_step` is shown below; ellipses stand for configuration arguments:
 
 ```python
 def objective(params, batch, weight):
@@ -268,87 +246,86 @@ updates, opt_state = optimizer.update(grads, state.opt_state, state.params_f32)
 params_f32 = optax.apply_updates(state.params_f32, updates)
 ```
 
-### Adam 优化器的行为
+### Adam updates
 
-Adam（Adaptive Moment Estimation，自适应矩估计）同时使用当前梯度与历史统计量。它维护梯度的一阶矩 $`m`$ 和二阶原点矩 $`v`$（梯度平方的指数移动平均，不是方差），经偏差修正后，基本更新形式是 $`\Delta\theta = -\eta\hat{m}/(\sqrt{\hat{v}}+\varepsilon)`$。因此：
+Adam (Adaptive Moment Estimation) uses both the current gradient and historical statistics. It maintains a first moment $`m`$ and a second raw moment $`v`$, the exponential moving average of squared gradients rather than their variance. After bias correction, the basic update is $`\Delta\theta = -\eta\hat{m}/(\sqrt{\hat{v}}+\varepsilon)`$. Consequently:
 
-- 相同的梯度在不同的 Adam 状态下可能得到不同的参数变化；
-- 即使当前梯度为零，也可能因为已有的动量 $`m`$ 继续移动参数。
+- The same gradient can produce different parameter changes under different Adam states.
+- Even a zero current gradient can leave an update driven by existing momentum $`m`$.
 
-### 混合精度与主参数
+### Mixed precision and master parameters
 
-仓库通常保留 FP32 精度的主参数（Master Weights）和 Adam 状态，允许模型计算使用 BF16（bfloat16，16 位浮点格式）。这样，小于 BF16 表示精度的微小参数变化仍有机会在 FP32 主参数中逐步累积。不能每步把 BF16 计算副本转回 FP32，就当作原来的主参数——这会截断累积中的微小更新。
+The project normally keeps master parameters and Adam state in FP32 while allowing BF16 (bfloat16) model computation. Small changes below BF16 resolution can then accumulate in the FP32 parameters. Casting a BF16 working copy back to FP32 every step does not recover the original master parameters; it discards the small updates being accumulated.
 
-### 数值对照的层级
+### Levels of numerical comparison
 
-验证实现正确性时，应当沿这条路径逐级检查：loss 接近不一定说明全部梯度都接近，梯度接近也不一定说明优化器状态和实际写回的参数变化接近。保存与续训还必须完整恢复 Adam 状态、数据游标（data cursor）和采样随机状态（Random Number Generator，RNG；当前原生路径由 seed、data cursor 和 key 使用规则共同重建），保存与恢复的实现见[整体设计](design-overview.md)，运行方法见[快速开始](quickstart.md)。
+Correctness checks should follow the full chain. Similar losses do not establish that all gradients are similar, and similar gradients do not establish similar optimizer states or parameter changes. Recovery must also restore Adam state, the data cursor, and sampling RNG behavior. In the current native implementation, RNG behavior is reconstructed from the seed, cursor, and key-use rules. See the [design overview](design-overview.md) for checkpoint implementation and the [quickstart](quickstart.md) for commands.
 
-## 8. 相关衍生算法对比
+## 8. Related algorithms
 
-在保持"计算前向 logprob → 优化器更新"基本路径不变的前提下，不同算法在 advantage 计算、裁剪机制和聚合方式上做出了针对性调整。以下是 [algorithms.py](../gemma4_posttrain_jax/algorithms.py) 及训练 CLI 的默认组合，命令行覆盖后以最终配置为准。
+The basic path from forward logprobs to optimizer updates remains the same, but related algorithms change advantage computation, clipping, and reduction. The following combinations are the defaults in [algorithms.py](../gemma4_posttrain_jax/algorithms.py) and the training CLI. Command-line overrides determine the final configuration.
 
 ### Dr. GRPO
 
-去掉了 advantage 的标准差归一化，改为只减组内均值，并用固定生成长度预算作为分母。对同一组 `[1, 1, 0, 0]` 的奖励，advantage 变为正负 $`0.5`$（而非正负 $`0.866`$）。回答长度的变化不再改变分母。这两项调整分别影响奖励尺度与 token 权重。
+Dr. GRPO removes standard-deviation normalization, subtracting only the group mean, and uses a fixed generation-length budget as the denominator. For rewards `[1, 1, 0, 0]`, the advantages become positive and negative $`0.5`$ rather than $`0.866`$. Response length no longer changes the denominator. The two changes affect reward scaling and token weighting respectively.
 
 ### DAPO
 
-DAPO（Decoupled Clip and Dynamic sAmpling Policy Optimization，可理解为分离裁剪边界、结合动态采样的策略优化）使用较大的上侧裁剪范围（如 $`0.28`$），并对全 batch 的有效 token 取平均。完整的 `dapo` 入口还包括动态补采、截断过滤和软长度惩罚，而 `dapo-loss` 入口只选择相应的目标函数。动态补采按二值成功标记保留同题组内既有成功又有失败的组——格式奖励不能代替成功标记。这些组成部分对应 [DAPO 的算法说明](https://dapo-sia.github.io/)。
+DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization) uses a larger upper clipping margin, such as $`0.28`$, and averages over all valid tokens in the batch. The full `dapo` entry point also includes dynamic resampling, truncation filtering, and a soft length penalty. `dapo-loss` selects only the corresponding objective. Dynamic resampling retains question groups containing both successes and failures, using binary success flags; a formatting reward cannot substitute for those flags. See the [DAPO algorithm description](https://dapo-sia.github.io/).
 
 ### GSPO-token
 
-GSPO（Group Sequence Policy Optimization，组序列策略优化）将概率比的统计对象扩展到序列层面。本项目实现的是 GSPO-token：先计算回答内的平均 log-ratio，再用 `policy − stop_gradient(policy) + stop_gradient(sequence_log_ratio)` 保留当前 token 的导数。前向统计与反向路径需要同时说明，不能把它笼统概括为任意的"序列级 GRPO"。[GSPO 论文](https://arxiv.org/abs/2507.18071)介绍了序列概率比的动机；当前代码的具体计算以 `grpo_loss` 为准。
+GSPO (Group Sequence Policy Optimization) defines probability ratios at the sequence level. This project implements GSPO-token: it first computes the response's mean log-ratio, then uses `policy − stop_gradient(policy) + stop_gradient(sequence_log_ratio)` to retain the current token's derivative. Both the forward statistic and backward path matter; describing it only as “sequence-level GRPO” would miss that distinction. The [GSPO paper](https://arxiv.org/abs/2507.18071) explains the motivation for sequence probability ratios; `grpo_loss` defines this implementation's exact computation.
 
 ### RLOO
 
-RLOO（REINFORCE Leave-One-Out，使用留一基准的策略梯度）先以同组其他 $`G-1`$ 条回答的平均奖励作为基准，再让当前回答的奖励减去这个基准。在上面的例子中，advantage 变为正负 $`2/3`$。当前实现不做 PPO 概率比裁剪，按回答内 token 求和后再对回答取平均；CLI 限制 $`\mu=1`$、$`\beta=0`$ 等组合。
+RLOO (REINFORCE Leave-One-Out) subtracts the mean reward of the other $`G-1`$ responses in the group from the current response's reward. In the example above, advantages become positive and negative $`2/3`$. This implementation does not apply PPO probability-ratio clipping. It sums over tokens within each response, then averages over responses. The CLI restricts supported combinations, including $`\mu=1`$ and $`\beta=0`$.
 
-### 对比总览
+### Comparison
 
-| 算法 | Advantage 计算方式 | 概率比与裁剪范围 | Loss 聚合方式 |
+| Algorithm | Advantage | Probability ratio and clipping interval | Loss reduction |
 |---|---|---|---|
-| **GRPO** | 组内均值及标准差标准化 | Token 级；$`[0.8, 1.2]`$ | 行内求均值，再按非空回答行求均值 |
-| **Dr. GRPO** | 仅减去组内均值 | Token 级；$`[0.8, 1.2]`$ | 除以固定生成长度预算，再对回答求均值 |
-| **DAPO / DAPO loss** | 组内均值及标准差标准化 | Token 级；非对称区间 $`[0.8, 1.28]`$ | 全 Batch 所有有效 Token 取均值 |
-| **GSPO-token** | 组内均值及标准差标准化 | 序列平均 Log-Ratio 构造的 ratio；$`[0.9997, 1.0004]`$ | 行内求均值，再按非空回答行求均值 |
-| **RLOO** | 留一法基准 | Token 级；无 PPO 裁剪 | 行内求和，再按回答行求均值 |
+| **GRPO** | Center and scale by the group mean and standard deviation | Per token; $`[0.8, 1.2]`$ | Mean within each response, then mean over nonempty responses |
+| **Dr. GRPO** | Subtract the group mean only | Per token; $`[0.8, 1.2]`$ | Divide by the fixed generation-length budget, then average over responses |
+| **DAPO / DAPO loss** | Center and scale by the group mean and standard deviation | Per token; asymmetric interval $`[0.8, 1.28]`$ | Mean over all valid tokens in the batch |
+| **GSPO-token** | Center and scale by the group mean and standard deviation | Ratio from the sequence's mean log-ratio; $`[0.9997, 1.0004]`$ | Mean within each response, then mean over nonempty responses |
+| **RLOO** | Leave-one-out baseline | Per token; no PPO clipping | Sum within each response, then mean over responses |
 
-这些选择会改变梯度的尺度和样本的权重，不能因为某种算法的 loss 数值更小就断定效果更好。做学习实验时还需要对齐数据、生成 token 数、更新次数和总成本。相同 Adam 步数不代表相同生成预算，训练过程中的监测也需要与最终独立评估分开。
+These choices change gradient scales and sample weights. A smaller loss does not establish better learning. Comparisons also need aligned data, generated-token counts, update counts, and total cost. Equal Adam-step counts do not imply equal generation budgets, and training-time monitoring is separate from final independent evaluation.
 
 ---
 
-## 9. 训练流程的总控逻辑
+## 9. Orchestrating the training loop
 
-[train_grpo.py](../scripts/train_grpo.py) 在主机端组织数据与生成，在设备端执行模型及梯度计算。整个流程按以下时序运行：
+[train_grpo.py](../scripts/train_grpo.py) organizes data and generation on the host and executes model and gradient computations on the devices. The sequence is:
 
+```text
+Select questions by data_cursor; derive the random key from seed and cursor
+       |
+       v
+Place G responses per question consecutively; generate tokens, masks, raw logprobs
+       |
+       v
+Decode on the host and score with the verifier
+       |  Optional DAPO resampling repeats until complete groups are available
+       v
+Compute advantages from final rewards and construct the loss mask
+       |
+       v
+Compute frozen Reference logprobs if KL is enabled
+       |
+       v
+Perform μ training updates on the same responses:
+  1. Run the forward pass with the current parameters for Current logprobs.
+  2. On the first update, capture Old from that pass; reuse it thereafter.
+  3. Construct the loss: Policy Loss + β × KL Loss.
+  4. Backpropagate; weight microbatch accumulation by the objective's denominator.
+  5. Apply Adam to the FP32 master parameters.
+       |
+       v
+Evaluate, save a checkpoint, or start the next rollout
 ```
-[按 data_cursor 选择问题，从 seed 与 cursor 派生随机 key]
-       │
-       ▼
-[为每题建立连续 G 条回答输入，生成器返回 token、mask、raw logprob]
-       │
-       ▼
-[主机解码文本 & 验证器评分] ──(可选: DAPO 动态补采，重复直到得到完整组)
-       │
-       ▼
-[根据最终奖励计算 Advantage，建立 loss mask]
-       │
-       ▼
-[计算固定 Reference 的 logprob（若启用 KL）]
-       │
-       ▼
-┌─► [同一批回答执行 μ 次训练更新] ─────────────────────────────────┐
-│   1. 用本次参数前向计算 current policy logprob          │
-│   2. 首次更新：从同一次前向捕获 old；后续更新复用 old      │
-│   3. 组装 Loss（Policy Loss + β × KL Loss）             │
-│   4. 反向传播；若分 microbatch，按目标分母累积梯度         │
-│   5. Adam 优化器更新 FP32 主参数                        │
-└────────────────────────────────────────────────────────┘
-       │
-       ▼
-[评估、保存 Checkpoint，或开始下一轮生成]
-```
 
-`data_cursor` 是指向训练数据的位置指针，记录的是已经处理的候选问题批次，`step` 记录的是 Adam 更新次数。被动态补采筛掉的回答虽然没有参与参数更新，但已经推进了数据位置和随机 key 的批次编号——因此这两个计数器不能互相替代。这恰恰是算法流程与断点续训设计衔接的地方。
+`data_cursor` records the candidate question batches consumed; `step` records Adam updates. Responses discarded by dynamic resampling still advance the data position and the batch index used for random keys. These counters cannot substitute for one another, which connects the algorithm's control flow directly to checkpoint-recovery design.
 
-通过这一套闭环流程，模型实现了从"自行尝试生成"到"利用标量奖励反馈调整参数"的完整循环，使语言模型可以利用回答级奖励训练，而不要求每个推理步骤都有标准答案；是否改善复杂推理能力，仍取决于奖励、数据和训练设置，需要由独立评估确认。
+This loop lets a language model generate its own attempts and adjust parameters using scalar response-level rewards, without a target answer for every reasoning step. Whether it improves complex reasoning depends on the rewards, data, and training settings and must be established through independent evaluation.

@@ -55,6 +55,7 @@ class TinyTokenizer:
     "dynamic,attempt_budget,is_cap,prompt_style,rollout_layout,lora",
     [
         (False, 2, None, "chat", "replicated", False),
+        pytest.param(True, 2, None, "chat", "tp", False, id="tp-xla-resume-eval"),
         (False, 2, 1.5, "chat", "replicated", False),
         (True, 2, None, "chat", "replicated", False),
         (True, 2, 1.5, "chat", "replicated", False),
@@ -81,6 +82,16 @@ def test_mu_two_host_loop_resume_preserves_old_batch_and_full_state(
 ) -> None:
     assert jax.default_backend() == "cpu"
     hf, params, config = tpu_grad_tiny if len(jax.devices()) > 1 else grad_tiny
+    if rollout_layout == "tp":
+        from conftest import TINY_A, build_hf_model
+
+        from gemma4_posttrain_jax.model import config_from_hf
+        from gemma4_posttrain_jax.weights import convert_gemma4_text_params
+
+        spec = {**TINY_A, "num_key_value_heads": 1, "vocab_size": 96, "vocab_size_per_layer_input": 96}
+        hf = build_hf_model(spec, seed=7, weight_std=0.03, norm_std=0.05, layer_scalar_min=0.8)
+        config = config_from_hf(spec)
+        params = convert_gemma4_text_params(hf.state_dict().__getitem__, config)
     path = Path(__file__).resolve().parents[1] / "scripts" / "train_grpo.py"
     spec = importlib.util.spec_from_file_location("grpo_host_test", path)
     assert spec is not None and spec.loader is not None
@@ -172,6 +183,8 @@ def test_mu_two_host_loop_resume_preserves_old_batch_and_full_state(
             command += ["--kl-clamp-value", str(kl_clamp_value)]
         if (layout or rollout_layout) != "replicated":
             command += ["--rollout-layout", layout or rollout_layout]
+        if (layout or rollout_layout) == "tp":
+            command += ["--tp-allreduce", "xla"]
         if (style or prompt_style) != "chat":
             command += ["--prompt-style", style or prompt_style]
         if is_cap is not None:
@@ -261,7 +274,7 @@ def test_mu_two_host_loop_resume_preserves_old_batch_and_full_state(
     assert saved_config["kl_estimator"] == ("k3-stable-series-v2" if beta else "none")
     assert saved_config["kl_clamp_value"] == kl_clamp_value
     assert saved_config.get("rollout_layout", "replicated") == rollout_layout
-    assert ("rollout_layout" in saved_config) == (rollout_layout == "fsdp")
+    assert ("rollout_layout" in saved_config) == (rollout_layout in ("fsdp", "tp"))
     with pytest.raises(ValueError, match="resume configuration|LoRA currently requires"):
         run(
             "changed_rollout_layout",
@@ -368,6 +381,54 @@ def test_mu_two_host_loop_resume_preserves_old_batch_and_full_state(
             monkeypatch.setattr(sys, "argv", [*evaluation_command, "--output-dir", str(tmp_path / "changed_base_eval")])
             with pytest.raises(ValueError, match="字节改变"):
                 evaluator.main()
+    if rollout_layout == "tp":
+        import gemma4_posttrain_jax.evaluation as evaluation
+
+        monkeypatch.setattr(trainer, "read_checkpoint_metadata", original_metadata_reader)
+        monkeypatch.setattr(evaluation, "load_gsm8k", lambda split: dataset)
+        monkeypatch.setitem(sys.modules, "train_grpo", trainer)
+        eval_spec = importlib.util.spec_from_file_location(
+            "tp_checkpoint_evaluation", path.with_name("evaluate_gsm8k.py")
+        )
+        assert eval_spec is not None and eval_spec.loader is not None
+        evaluator = importlib.util.module_from_spec(eval_spec)
+        eval_spec.loader.exec_module(evaluator)
+        monkeypatch.setattr(evaluator, "load_hf_params", trainer.load_hf_params)
+        monkeypatch.setattr(evaluator, "load_hf_eos_token_ids", lambda *args, **kwargs: (1,))
+        independent = tmp_path / "independent_tp_eval"
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "evaluate_gsm8k.py",
+                "--checkpoint",
+                str(continuous_checkpoints / "step_00000004"),
+                "--subset",
+                "train-dev",
+                "--size",
+                "2",
+                "--dev-size",
+                "2",
+                "--dev-seed",
+                "19",
+                "--batch-size",
+                "4",
+                "--max-prompt-len",
+                "4",
+                "--max-new-tokens",
+                "4",
+                "--reward-workers",
+                "1",
+                "--output-dir",
+                str(independent),
+            ],
+        )
+        evaluator.main()
+        assert (independent / "evaluation/predictions.jsonl").read_bytes() == (
+            continuous / "eval/step_00000004/predictions.jsonl"
+        ).read_bytes()
+        arguments = json.loads((independent / "meta.json").read_text())["arguments"]
+        assert arguments["rollout_layout"] == "tp" and arguments["tp_allreduce"] == "xla"
 
 
 @pytest.mark.parametrize("clamp", [None, 1e-6])

@@ -1,4 +1,4 @@
-"""真实socket协议与CPU进程组控制；设备提交响应在本测试中为显式模拟。"""
+"""Test real socket transport and CPU process-group control, with explicitly simulated device commit responses."""
 
 import contextlib
 import hashlib
@@ -65,7 +65,7 @@ def test_host_receive_cannot_advance_version_without_valid_commit(tiny_a, finish
         received, transport = receive_parameters(right, request["descriptor"], config)
         for expected, actual in zip(jax.tree.leaves(host), jax.tree.leaves(received), strict=True):
             np.testing.assert_array_equal(expected.view(np.uint32), actual.view(np.uint32))
-        # 全部主机字节和ACK都到达后，调用仍阻塞、旧版本仍保持。
+        # Even after all host bytes and acknowledgements arrive, the call must wait and retain the old version.
         assert not future.done() and client.policy_version == 0 and transport["device_commit"] is False
         if finish == "disconnect":
             right.shutdown(socket.SHUT_RDWR)
@@ -220,7 +220,7 @@ def test_cannot_target_training_process_group():
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux进程组边界")
 @pytest.mark.parametrize(("exit_code", "timed_out"), [(0, False), (0, True), (1, True)])
 def test_wait_timeout_is_not_a_signal_and_cannot_qualify_close(monkeypatch, exit_code, timed_out):
-    """重放wait报告超时、组扫描时worker已自行退出的竞态。"""
+    """Replay a timeout race in which the worker exits before the process-group scan."""
     worker = subprocess.Popen(
         [sys.executable, "-c", f"raise SystemExit({exit_code})"],
         stdin=subprocess.DEVNULL,
@@ -247,7 +247,7 @@ def test_wait_timeout_is_not_a_signal_and_cannot_qualify_close(monkeypatch, exit
 
         monkeypatch.setattr(worker, "wait", first_wait_times_out)
         monkeypatch.setattr(worker, "poll", initially_live_poll)
-        # 只重放超时竞态；若误发信号立即使本测试失败。
+        # Replay only the timeout race; fail immediately if a signal is sent incorrectly.
         monkeypatch.setattr(os, "killpg", lambda *args: pytest.fail("已退出的空组不应收到信号"))
         runtime = RemoteEngineRuntime.__new__(RemoteEngineRuntime)
         runtime._closed = False
@@ -257,7 +257,7 @@ def test_wait_timeout_is_not_a_signal_and_cannot_qualify_close(monkeypatch, exit
         runtime._process = worker
         runtime._directory = Path(tempfile.mkdtemp(prefix="g4-wait-timeout-control-"))
         runtime._socket_path = runtime._directory / "engine.sock"
-        # close响应为显式模拟；这样退出0的成功控制只因wait是否超时而改变资格。
+        # Simulate the close response so the wait deadline alone determines whether an exit-zero run passes.
         monkeypatch.setattr(runtime, "_request", lambda operation: 0)
         monkeypatch.setattr(runtime, "_response", lambda request_id, status: {"report": {"complete": True}})
         report = runtime.close()

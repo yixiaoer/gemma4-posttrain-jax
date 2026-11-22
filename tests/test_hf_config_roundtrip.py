@@ -1,4 +1,4 @@
-"""HF保存配置的逐层attention覆盖必须在JAX重新加载后保持权重、shape和前向语义。"""
+"""Preserve HF per-layer attention settings, weight shapes, and forward behavior when reloading in JAX."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def test_equal_explicit_global_kv_count_survives_hf_serialization(tiny_b):
     legacy["num_global_key_value_heads"] = legacy["num_key_value_heads"]
     serialized = type(model.config)(**legacy).to_dict()
     parsed, expected = config_from_hf(serialized), config_from_hf(legacy)
-    # HF稀疏序列化会删除与全局值相同的冗余覆盖；比较实际逐层维度，而非已删除的字段身份。
+    # HF removes overrides equal to global defaults; compare effective layer dimensions rather than missing fields.
     assert parsed == expected._replace(num_global_key_value_heads=None)
     for index in range(parsed.num_hidden_layers):
         assert layer_head_dim(parsed, index) == layer_head_dim(expected, index)

@@ -1,7 +1,8 @@
-"""将 JAX 文本模型的各个参数数组同步到已有的 Gemma4 NNX 推理模型。
+"""Sync JAX text-model parameters into an existing Gemma 4 NNX inference model.
 
-只负责参数布局、BF16 转换和同步传输。调用方须先排空请求并释放旧 KV，随后统一
-刷新 runner.state/state_leaves、重建 KV 和提交版本。此模块不导入 tpu-inference。
+Handle parameter layout, BF16 conversion, and synchronous transfer. The caller must drain requests and release
+old KV caches first, then refresh runner.state/state_leaves, rebuild KV caches, and commit the version. This
+module does not import tpu-inference.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ PRESERVED_PREFIXES = ("model.vision_tower.", "model.embed_vision.")
 
 
 def bf16_finite(value: np.ndarray) -> bool:
-    """全部BF16编码的指数域检查，不执行浮点运算。"""
+    """Check exponent bits for every BF16 encoding without floating-point operations."""
     from ml_dtypes import bfloat16
 
     if value.dtype != np.dtype(bfloat16):
@@ -32,7 +33,7 @@ def bf16_finite(value: np.ndarray) -> bool:
 
 
 def bf16_bits_equal(actual: np.ndarray, expected: np.ndarray) -> bool:
-    """按逻辑索引比较位；调用方另核expected有限，正负零也须保持原位。"""
+    """Compare bits by logical index, including signed zero; the caller separately checks that expected is finite."""
     from ml_dtypes import bfloat16
 
     if actual.dtype != np.dtype(bfloat16) or expected.dtype != np.dtype(bfloat16):
@@ -41,7 +42,7 @@ def bf16_bits_equal(actual: np.ndarray, expected: np.ndarray) -> bool:
 
 
 class InferenceWeightError(RuntimeError):
-    """保留部分更新、失败阶段与原数组恢复结果，供生命周期层保存证据。"""
+    """Retain partial updates, the failed stage, and rollback results for the lifecycle manager."""
 
     def __init__(self, message: str, report: dict[str, Any]):
         super().__init__(message)
@@ -215,10 +216,10 @@ def _host_bf16(item: _Mapping) -> np.ndarray:
 def apply_gemma4_params(
     runner: Any, params: Gemma4TextParams, config: Gemma4TextConfig, *, transport: str = "host"
 ) -> dict[str, Any]:
-    """更新已有 runner.model 的完整有效文本参数；保留原分片、Param对象和FP32 master。
+    """Update all active text parameters in runner.model, preserving sharding, Param objects, and the FP32 master.
 
-    成功后缓存 state_leaves 仍由调用方刷新。失败时恢复已经替换的 Param 原数组，
-    并通过 InferenceWeightError.report 返回恢复证据；不擅自继续 serving。
+    The caller refreshes cached state_leaves after success. On failure, restore replaced Param arrays and return
+    rollback details through InferenceWeightError.report rather than resuming serving.
     """
     import jax
     from flax import nnx

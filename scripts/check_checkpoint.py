@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""在 CPU 上分块检查训练状态的数组、数值和步数。"""
+"""Inspect checkpoint arrays, values, and step counts in bounded CPU chunks."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def check_checkpoint(path: Path, expected_step: int, *, require_nonzero_adam: bo
             moment = next(
                 (key for key in moment_nonzero if name.startswith(f"{prefix}.opt_state") and f".{key}." in name), None
             )
-            # 按首轴切片，避免一次加载最大的PLE表或整份Adam状态。
+            # Slice along the first axis instead of loading the largest PLE table or all Adam state at once.
             row_bytes = math.prod(shape[1:]) * dtype.itemsize
             rows = max(1, 8 * 2**20 // max(1, row_bytes)) if shape else 1
             for start in range(0, shape[0] if shape else 1, rows):

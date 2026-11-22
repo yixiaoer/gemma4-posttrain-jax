@@ -1,4 +1,4 @@
-"""保存一步滞后采样所需的训练状态和 CPU 行为策略快照。"""
+"""Save training state and a CPU behavior-policy snapshot for sampling one update behind."""
 
 from __future__ import annotations
 
@@ -26,7 +26,9 @@ class LaggedTrainState(NamedTuple):
 
 
 def load_lagged_train_state(path: Path, template: TrainState, shardings: Any) -> LaggedTrainState:
-    """恢复完整训练状态，将行为策略快照放到 CPU；缺失的快照不能用当前参数代替。"""
+    """Restore full training state and the CPU behavior snapshot; current parameters cannot replace a missing
+    snapshot.
+    """
     behavior = BehaviorSnapshot(
         cast(
             Gemma4TextParams,

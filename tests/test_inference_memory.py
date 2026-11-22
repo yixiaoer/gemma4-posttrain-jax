@@ -1,4 +1,4 @@
-"""观测数据缺失必须显式保留，不能用零填充造成虚假的HBM结论。"""
+"""Keep missing memory observations explicit; filling them with zero would produce false HBM claims."""
 
 from types import SimpleNamespace
 

@@ -1,7 +1,8 @@
-"""共同 JAX 运行时中的 2+2 权重传输；两侧须按相同顺序调用。
+"""Transfer weights between two training and two inference chips in a shared JAX runtime.
 
-训练侧保留原 FP32 分片，单个参数在设备上转换成 BF16 位编码后发送。
-本模块不创建进程或引擎；部署、事务提交及独立内容验证由调用方负责。
+Both sides must call in the same order. Keep the original FP32 training shards and encode one parameter as BF16
+bits on the device before sending it. The caller manages processes, engines, version commits, and independent
+content checks.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from typing import Any, cast
 
 @lru_cache(maxsize=256)
 def mapped_weight_bits(layout: str, shape: tuple[int, ...], shards: int, sharding: Any) -> Any:
-    """直接从训练参数生成按行分片的 uint16；排列和 padding 不经过浮点运算。"""
+    """Create row-sharded uint16 data from training parameters; permuting and padding do not use float arithmetic."""
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding
@@ -49,7 +50,7 @@ def mapped_weight_bits(layout: str, shape: tuple[int, ...], shards: int, shardin
 
 
 class SharedRuntimeWeightTransfer:
-    """四颗芯片中，前两颗发送、后两颗各保留完整副本；不承担引擎版本事务。"""
+    """Send from the first two chips to a full copy on each of the last two; the caller commits engine versions."""
 
     def __init__(self, devices: list[Any], *, chunk_bytes: int = 16 << 20, verify: bool = False):
         import jax
@@ -108,7 +109,7 @@ class SharedRuntimeWeightTransfer:
         return 0 in self.local_ranks
 
     def transfer(self, shape: tuple[int, ...], source: Any | None) -> tuple[dict[int, Any], dict[str, Any]]:
-        """接收结果只位于目标进程；完整权重不经过主机，结果尚未提交给引擎。"""
+        """Receive device weights on the destination process, without host staging or committing the engine version."""
         import jax
         import numpy as np
 
@@ -155,7 +156,8 @@ class SharedRuntimeWeightTransfer:
                     (4, 2 * length, *shape[1:]), self.sharding, written_buffers
                 )
                 checked = self.check_written(packed, written)
-                # 只读取复制的一个整数；完整目标分块经 ICI 返回发送侧比较。
+                # Read only a replicated integer; return full destination blocks over ICI for comparison on the
+                # sender.
                 if int(checked.addressable_shards[0].data) != 1:
                     raise ValueError("ICI 接收数组的实际内容与训练源不同")
                 del written, written_buffers, checked

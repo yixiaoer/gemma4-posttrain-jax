@@ -1,4 +1,4 @@
-"""生成入口的参数、批量输入和真实小模型生成测试。"""
+"""Test generation CLI settings, batched inputs, and actual tiny-model generation."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def test_transformers_full_vocab_sampling_does_not_inherit_default_top_k():
 
 @pytest.mark.parametrize("temperature,top_p", [(0.0, 1.0), (0.8, 1e-8)])
 def test_cli_batch_generation_matches_transformers_with_one_candidate(tiny_a, monkeypatch, capsys, temperature, top_p):
-    """不下载权重；两边实际执行同一小模型，greedy和极小Top-p均只有一个候选。"""
+    """Run the same tiny model in both frameworks without downloads; greedy and very small top-p select one token."""
     hf, params, config = tiny_a
     tokenizer = Tokenizer()
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **kw: tokenizer)

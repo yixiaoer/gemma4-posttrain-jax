@@ -1,4 +1,4 @@
-"""直接验证K3的值、梯度、mask与裁剪，不依赖研究脚本。"""
+"""Test K3 values, gradients, masks, and clipping directly, without relying on experiment scripts."""
 
 from decimal import Decimal, localcontext
 
@@ -73,7 +73,7 @@ def test_clamped_product_k3_has_finite_gradients_at_large_differences(compiled, 
     assert np.isfinite(gradients).all()
     assert values[-1] == np.float32(clamp)
     np.testing.assert_array_equal(gradients[-2:], 0)
-    # 巨大负差值不需要计算指数，数学值约等于-d-1。
+    # For a large negative difference, the exponential is negligible and the result is approximately -d-1.
     assert values[0] == np.float32(min(1e20, clamp))
     assert gradients[0] == (0 if clamp < 1e20 else -1)
 

@@ -46,7 +46,7 @@ def normalize_gsm8k_answer(text: str) -> tuple[str, str]:
 
 
 def example_gold(example: Mapping[str, Any]) -> Gold:
-    """显式规范化gold保留符号；原GSM8K行继续走既有数值答案协议。"""
+    """Preserve symbols in explicitly normalized answers; use the existing numeric protocol for GSM8K rows."""
     if "gold" not in example:
         return normalize_gsm8k_answer(str(example["answer"]))[1]
     gold = example["gold"]
@@ -81,7 +81,7 @@ def format_prompt(question: str, tokenizer: Any, *, chat: bool = True) -> list[i
     if chat:
         user = {"role": "user", "content": content}
         return _token_ids(tokenizer.apply_chat_template([user], tokenize=True, add_generation_prompt=True))
-    # base/it tokenizer默认BOS处理不同；plain对照显式保留一个相同BOS。
+    # Base and instruction tokenizers handle BOS differently; plain prompts explicitly keep one BOS token.
     return [int(tokenizer.bos_token_id), *_token_ids(tokenizer(content, add_special_tokens=False))]
 
 
@@ -191,7 +191,7 @@ def eval_subset(dataset: Sequence[Any], *, size: int = 500, seed: int = 0) -> li
 
 
 def grpo_prompt_indices(dataset_size: int, prompt_batch_size: int, step: int, *, seed: int = 0) -> list[int]:
-    """按候选问题批次的位置还原顺序；step 接收 data_cursor，包含补采后未用于训练的批次。"""
+    """Recover prompt order from data_cursor, including candidate batches discarded during resampling."""
 
     if not 0 < prompt_batch_size <= dataset_size or step < 0:
         raise ValueError("need 0 < prompt_batch_size <= dataset_size and step >= 0")
@@ -204,7 +204,7 @@ def grpo_prompt_indices(dataset_size: int, prompt_batch_size: int, step: int, *,
 
 
 def split_holdout_indices(dataset_size: int, holdout_size: int, *, seed: int = 0) -> tuple[list[int], list[int]]:
-    """返回原始题号的剩余集/固定留出集；不重新编号，零留出保持原顺序。"""
+    """Return training and fixed holdout indices without renumbering; a zero holdout preserves input order."""
     if dataset_size <= 0 or not 0 <= holdout_size < dataset_size:
         raise ValueError("holdout必须在[0, dataset_size)内，剩余集不能为空")
     held_out = eval_subset(list(range(dataset_size)), size=holdout_size, seed=seed) if holdout_size else []

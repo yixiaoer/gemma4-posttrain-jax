@@ -1,4 +1,4 @@
-"""双进程权重同步的主机内存候选必须保持源数组和关闭语义。"""
+"""Check that host-memory optimizations for separate-process weight sync preserve sources and cleanup behavior."""
 
 from __future__ import annotations
 

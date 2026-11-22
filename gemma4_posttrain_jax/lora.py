@@ -1,4 +1,4 @@
-"""独立保存 attention 的 LoRA 参数；基础权重保持冻结，缩放和合并使用纯函数。"""
+"""Store attention LoRA adapters separately from frozen base weights; scale and merge them with pure functions."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def projection_dimensions(weight: Array, name: str) -> tuple[int, int]:
 
 
 def init_lora_params(base: Gemma4TextParams, config: LoRAConfig, key: Array) -> Gemma4LoRAParams:
-    """仅初始化新增适配器；A为高斯、B为零，不创建或替换HF基础模型参数。"""
+    """Initialize only the adapters, with Gaussian A and zero B, without constructing or replacing base weights."""
     check_lora_config(config)
     layers = []
     for layer in base.layers:
@@ -59,7 +59,7 @@ def init_lora_params(base: Gemma4TextParams, config: LoRAConfig, key: Array) -> 
         for name in AttentionLoRAParams._fields:
             weight = getattr(layer.attention, name)
             if name not in config.targets or weight is None:
-                # 共享KV层不新增K/V；12B的K=V层只修改原有K投影，保持共享语义。
+                # Shared-KV layers add no K/V adapters; 12B K=V layers modify only the existing K projection.
                 values.append(None)
                 continue
             inputs, outputs = projection_dimensions(weight, name)
@@ -91,7 +91,7 @@ def check_lora_params(base: Gemma4TextParams, params: Gemma4LoRAParams, config: 
 
 
 def prepare_lora_params(params: Gemma4LoRAParams, config: LoRAConfig) -> Gemma4LoRAParams:
-    """在可微图内把alpha/r乘入B；optimizer始终保存未缩放的FP32 A/B。"""
+    """Apply alpha/r to B inside the differentiable graph while the optimizer stores unscaled FP32 A and B."""
     check_lora_config(config)
     scale = config.alpha / config.rank
     return Gemma4LoRAParams(
@@ -105,7 +105,9 @@ def prepare_lora_params(params: Gemma4LoRAParams, config: LoRAConfig) -> Gemma4L
 
 
 def forward_lora_projection(params: LowRankParams | None, x: Array, base_output: Array) -> Array:
-    """B/S为前两轴；基础投影与低秩分支分别计算，避免先把微小增量舍入进BF16权重。"""
+    """Use leading batch/sequence axes and separate base and LoRA projections to avoid rounding small updates into
+    BF16.
+    """
     if params is None:
         return base_output
     flat = x.astype(params.a.dtype).reshape(x.shape[0], x.shape[1], -1)
@@ -116,7 +118,7 @@ def forward_lora_projection(params: LowRankParams | None, x: Array, base_output:
 def merge_lora_params(
     base: Gemma4TextParams, params: Gemma4LoRAParams, config: LoRAConfig, *, dtype: Any = jnp.float32
 ) -> Gemma4TextParams:
-    """导出时合并(alpha/r)AB，返回合并后的 Gemma4 模型参数；BF16导出舍入需单独报告。"""
+    """Merge (alpha/r)AB for export and return Gemma 4 parameters; assess BF16 export rounding separately."""
     check_lora_params(base, params, config)
     prepared = prepare_lora_params(params, config)
     layers = []
@@ -135,7 +137,7 @@ def merge_lora_params(
 def convert_back_lora_params(
     base: Gemma4TextParams, params: Gemma4LoRAParams, lora_config: LoRAConfig, model_config: Gemma4TextConfig
 ) -> dict[str, Any]:
-    """沿用原HF convert_back；仅在显式导出时合并，不改变训练的独立低秩分支。"""
+    """Use the existing HF convert_back path, merging only for export and keeping the training branches separate."""
     from gemma4_posttrain_jax.weights import convert_back_gemma4_text_params
 
     return convert_back_gemma4_text_params(merge_lora_params(base, params, lora_config), model_config)

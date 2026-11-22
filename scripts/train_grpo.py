@@ -13,11 +13,12 @@ import os
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -78,10 +79,13 @@ from gemma4_posttrain_jax.sharding import (
     shard_gemma4_text_params,
     tree_shardings,
 )
+from gemma4_posttrain_jax.tp_rollout import resolve_allreduce
 from gemma4_posttrain_jax.tracking import compile_tracking_metrics, grpo_tracking_metrics, init_tracker
 from gemma4_posttrain_jax.weights import load_hf_eos_token_ids, load_hf_params
 
 TIMING_PROTOCOL = "rl-iteration-stages-v3"
+# Apply only to explicit TP rollout; replicated and FSDP paths retain their compiler settings.
+UPDATE_COMPILER_OPTIONS = {"xla_tpu_scheduler_percent_shared_memory_limit": "75"}
 
 
 def iteration_device_allocation(
@@ -122,7 +126,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir", type=Path, required=True, help="new run directory; existing outputs are never overwritten"
     )
-    parser.add_argument("--rollout-layout", choices=("replicated", "fsdp"), default="replicated")
+    parser.add_argument("--rollout-layout", choices=("replicated", "fsdp", "tp"), default="replicated")
+    parser.add_argument(
+        "--tp-allreduce",
+        choices=("auto", "xla", "one_shot_fused", "one_shot_fused_high_rows_local"),
+        default="auto",
+        help="TP 生成的归约方式；auto 根据批量选择已登记路径，恢复时继承 checkpoint 的实际方式",
+    )
     parser.add_argument(
         "--rollout-backend", choices=("jax", "inference", "inference-process", "inference-distributed"), default="jax"
     )
@@ -334,7 +344,14 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
 
 
-def compile_call(name: str, fn: Any, arguments: tuple[Any, ...], output_dir: Path, save_hlo: bool) -> Any:
+def compile_call(
+    name: str,
+    fn: Any,
+    arguments: tuple[Any, ...],
+    output_dir: Path,
+    save_hlo: bool,
+    compiler_options: dict[str, str] | None = None,
+) -> Any:
     start = time.perf_counter()
     lowered = fn.lower(*arguments)
     lower_s = time.perf_counter() - start
@@ -345,13 +362,14 @@ def compile_call(name: str, fn: Any, arguments: tuple[Any, ...], output_dir: Pat
         stablehlo_dump_s = time.perf_counter() - dump_start
     backend_start = time.perf_counter()
     try:
-        compiled = lowered.compile()
+        compiled = lowered.compile() if compiler_options is None else lowered.compile(compiler_options=compiler_options)
     except Exception as error:
         backend_compile_s = time.perf_counter() - backend_start
-        record = {
+        record: dict[str, Any] = {
             "name": name,
             "status": "failed",
             "stage": "backend_compile",
+            "compiler_options": compiler_options,
             "compile_s": lower_s + backend_compile_s,
             "lower_s": lower_s,
             "backend_compile_s": backend_compile_s,
@@ -367,6 +385,7 @@ def compile_call(name: str, fn: Any, arguments: tuple[Any, ...], output_dir: Pat
     record = {
         "name": name,
         "status": "complete",
+        "compiler_options": compiler_options,
         "compile_s": lower_s + backend_compile_s,
         "lower_s": lower_s,
         "backend_compile_s": backend_compile_s,
@@ -412,7 +431,7 @@ def validate_resume_config(saved: Any, current: dict[str, Any]) -> None:
         raise ValueError(f"resume configuration differs from the checkpoint: {', '.join(changed)}")
 
 
-def main() -> None:
+def main(*, cycle_observer: Callable[[int, Literal["start", "end"]], None] | None = None) -> None:
     args = parse_args()
     process_inference = args.rollout_backend == "inference-process"
     distributed_inference = args.rollout_backend == "inference-distributed"
@@ -653,6 +672,22 @@ def main() -> None:
             indices=dev_indices[: args.eval_size] if args.eval_split == "train-dev" else None,
             chat=args.prompt_style == "chat",
         )
+    if args.rollout_layout == "tp" and (lora_config is not None or args.rollout_backend != "jax"):
+        raise ValueError("TP rollout 目前只接入原生全参数同步训练")
+    if args.rollout_layout == "tp" and args.rollout_lag_updates:
+        raise ValueError("本次 TP 入口要求当前策略同步生成，暂不接入滞后策略")
+    if args.rollout_layout != "tp" and args.tp_allreduce not in ("auto", "xla"):
+        raise ValueError("tp-allreduce 需要 rollout-layout=tp")
+    saved_rollout_config = (
+        None if args.resume is None else read_checkpoint_metadata(args.resume)["metadata"].get("run_config")
+    )
+    args.tp_allreduce = resolve_allreduce(
+        args.tp_allreduce,
+        layout=args.rollout_layout,
+        tp=mesh.size,
+        rows=(args.prompt_batch_size * args.group_size, *(() if not args.eval_every else (args.eval_batch_size,))),
+        saved=saved_rollout_config,
+    )
     # Training samples from the full policy; proposal corrections for temperature or top-k are left to later work.
     run_config = {
         "algorithm": "grpo-family-sync-v4",
@@ -799,6 +834,8 @@ def main() -> None:
             ).hexdigest()
     if args.rollout_layout != "replicated":
         run_config["rollout_layout"] = args.rollout_layout
+    if args.rollout_layout == "tp" and args.tp_allreduce != "xla":
+        run_config["tp_allreduce"] = args.tp_allreduce
     if args.prompt_style == "plain":
         run_config["prompt_style"] = "plain"
         run_config["prompt_protocol"] = "plain-bos-instruction-v2"
@@ -936,15 +973,52 @@ def main() -> None:
     )
     rollout_shardings = (
         named_shardings(param_specs_rollout(config, layout=args.rollout_layout, num_devices=mesh.size), mesh)
-        if frozen_base is None
+        if frozen_base is None and args.rollout_layout != "tp"
         else parameter_shardings
     )
+    tp_mesh = tp_specs = generate_compiler_options = None
+    if args.rollout_layout == "tp":
+        from gemma4_posttrain_jax.tp_rollout import (
+            attention_rows,
+            check_tp_config,
+            make_tp_mesh,
+            tp_param_specs,
+            tp_shardings,
+        )
+        from gemma4_posttrain_jax.tp_rollout import generate_compiler_options as tp_generate_options
+
+        check_tp_config(config, mesh.size)
+        tp_mesh = make_tp_mesh(1, mesh.size, list(mesh.devices.flat))
+        tp_specs = tp_param_specs(state.params_f32, attention_rows=attention_rows(args.tp_allreduce))
+        rollout_shardings = tp_shardings(tp_mesh, tp_specs)
+        generate_compiler_options = tp_generate_options(args.tp_allreduce)
     batch_sharding = NamedSharding(mesh, batch_spec(2))
+    sample_sharding = batch_sharding if tp_mesh is None else NamedSharding(tp_mesh, P())
+
+    def shard_sample_inputs(values: tuple[np.ndarray, ...]) -> tuple[Any, ...]:
+        if tp_mesh is None:
+            return tuple(shard_batch(values, mesh))
+        return tuple(jax.device_put(np.asarray(value), sample_sharding) for value in values)
+
     sampler_config = SamplerConfig(
         args.max_prompt_len, args.max_new_tokens, eos_ids=load_hf_eos_token_ids(str(args.model_path), config)
     )
 
     def sample_policy(current: Any, ids: Any, mask: Any, key: Any, sampler: SamplerConfig) -> RolloutBatch:
+        if tp_mesh is not None:
+            from gemma4_posttrain_jax.tp_rollout import tp_generate
+
+            return tp_generate(
+                current,
+                config,
+                ids,
+                mask,
+                sampler_config=sampler,
+                key=key,
+                mesh=tp_mesh,
+                param_specs=tp_specs,
+                allreduce=args.tp_allreduce,
+            )
         if lora_config is None:
             return generate(current, config, ids, mask, sampler_config=sampler, key=key, mesh=mesh)
         return generate(
@@ -958,16 +1032,21 @@ def main() -> None:
             lora=prepare_lora_params(current.adapters_f32, lora_config),
         )
 
+    def rollout_cast(current: Any) -> Any:
+        if lora_config is not None:
+            return current
+        if tp_mesh is not None:
+            return jax.tree.map(lambda value: value.astype(jnp.bfloat16), current)
+        return reshard_for_rollout(current, config, mesh, layout=args.rollout_layout)
+
     reshard_fn = jax.jit(
-        lambda current: (
-            reshard_for_rollout(current, config, mesh, layout=args.rollout_layout) if lora_config is None else current
-        ),
+        rollout_cast,
         in_shardings=(parameter_shardings,),
         out_shardings=rollout_shardings,
     )
     generate_fn = jax.jit(
         lambda current, ids, mask, key: sample_policy(current, ids, mask, key, sampler_config),
-        in_shardings=(rollout_shardings, batch_sharding, batch_sharding, None),
+        in_shardings=(rollout_shardings, sample_sharding, sample_sharding, None),
     )
     logps_fn = jax.jit(
         lambda current, ids, mask, completions, completion_mask: trainer_completion_logps(
@@ -1201,21 +1280,31 @@ def main() -> None:
             start = time.perf_counter()
             eval_params, _ = timed_call(reshard_executable, policy_params())
             if eval_executable is None:
-                first_batch = shard_batch((eval_batches[0].prompt_ids, eval_batches[0].prompt_mask), mesh)
+                first_batch = shard_sample_inputs((eval_batches[0].prompt_ids, eval_batches[0].prompt_mask))
                 eval_executable = compile_call(
                     "eval",
-                    make_eval_sampler(config, eval_sampler_config, mesh, rollout_layout=args.rollout_layout)
+                    make_eval_sampler(
+                        config,
+                        eval_sampler_config,
+                        mesh,
+                        rollout_layout=args.rollout_layout,
+                        param_tree=state.params_f32,
+                        tp_allreduce=args.tp_allreduce,
+                    )
                     if lora_config is None
                     else jax.jit(
                         lambda current, ids, mask, key: sample_policy(current, ids, mask, key, eval_sampler_config),
-                        in_shardings=(rollout_shardings, batch_sharding, batch_sharding, None),
+                        in_shardings=(rollout_shardings, sample_sharding, sample_sharding, None),
                     ),
                     (eval_params, *first_batch, jax.random.PRNGKey(args.eval_seed)),
                     args.output_dir,
                     args.save_hlo,
+                    generate_compiler_options,
                 )
             summary = evaluate_batches(
-                lambda current, prompt, valid, key: eval_executable(current, *shard_batch((prompt, valid), mesh), key),
+                lambda current, prompt, valid, key: eval_executable(
+                    current, *shard_sample_inputs((prompt, valid)), key
+                ),
                 eval_params,
                 eval_batches,
                 tokenizer,
@@ -1240,6 +1329,8 @@ def main() -> None:
                 step=start_step,
             )
         for rollout_step in range(start_step // args.updates_per_rollout, args.max_steps // args.updates_per_rollout):
+            if cycle_observer is not None:
+                cycle_observer(rollout_step + 1, "start")
             step = rollout_step * args.updates_per_rollout
             step_start = time.perf_counter()
             behavior_step = step if behavior_snapshot is None else int(behavior_snapshot.step)
@@ -1296,7 +1387,7 @@ def main() -> None:
                     pad_token_id=config.pad_token_id,
                     chat=args.prompt_style == "chat",
                 )
-                ids, mask = shard_batch((prompts.prompt_ids, prompts.prompt_mask), mesh)
+                ids, mask = shard_sample_inputs((prompts.prompt_ids, prompts.prompt_mask))
                 key = jax.random.fold_in(base_key, data_cursor)
                 data_cursor += 1
                 attempts += 1
@@ -1320,7 +1411,12 @@ def main() -> None:
                 else:
                     if generate_executable is None:
                         generate_executable = compile_call(
-                            "rollout", generate_fn, (rollout_params, ids, mask, key), args.output_dir, args.save_hlo
+                            "rollout",
+                            generate_fn,
+                            (rollout_params, ids, mask, key),
+                            args.output_dir,
+                            args.save_hlo,
+                            generate_compiler_options,
                         )
                     rollout, elapsed = timed_call(generate_executable, rollout_params, ids, mask, key)
                 rollout_s += elapsed
@@ -1579,6 +1675,7 @@ def main() -> None:
                     (state, *update_batch, *update_extra),
                     args.output_dir,
                     args.save_hlo,
+                    UPDATE_COMPILER_OPTIONS if tp_mesh is not None and jax.default_backend() == "tpu" else None,
                 )
             for iteration in range(args.updates_per_rollout):
                 step = rollout_step * args.updates_per_rollout + iteration
@@ -1851,6 +1948,8 @@ def main() -> None:
                 iteration_timing_file.write(json.dumps(timing_record, allow_nan=False) + "\n")
                 iteration_timing_file.flush()
                 iteration_timing_records.append(timing_record)
+            if cycle_observer is not None:
+                cycle_observer(rollout_step + 1, "end")
         training_finished = True
         write_json(
             args.output_dir / "training_end.json",

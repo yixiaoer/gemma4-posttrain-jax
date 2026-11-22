@@ -1,6 +1,8 @@
-"""TPU v4 单 chip attention：Splash 接口、双 TensorCore 分组及独立反向。
+"""Single-chip TPU v4 attention with Splash, two TensorCore groups, and a separate backward pass.
 
-验证范围为每个 chip 内的执行；不包含跨 chip 通信优化，尚非模型默认后端。"""
+Validation covers execution within each chip, not communication between chips. This is not the model's default
+backend.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +29,7 @@ def make_block_sizes(
     k_layout: str = "head",
     v_layout: str = "head",
 ) -> splash.BlockSizes:
-    """显式配置每个FA阶段；供执行入口和只读分析共用，不自动回退。"""
+    """Specify each attention stage explicitly for execution and inspection, without automatic fallback."""
     if fused_backward and (block_q_dq is not None or block_kv_dq is not None):
         raise ValueError("融合反向不能指定独立dQ分块")
     q_dkv = block_q if block_q_dkv is None else block_q_dkv
@@ -92,11 +94,11 @@ def attention(
     k_layout: str = "head",
     v_layout: str = "head",
 ) -> Any:
-    """BF16 Q[B,S,R,H,D]、K/V[B,T,H,D]、bool key_mask[B,T]。
+    """Accept BF16 Q[B,S,R,H,D], K/V[B,T,H,D], and boolean key_mask[B,T].
 
-    保持 scaling=1、k<=q 与 k>q-window。只接入训练/连续 prefill 核心；
-    不承诺 cache decode、dropout、soft-cap 或 packed segment 接口。
-    Splash 内部使用 BF16 MXU 精度，外围模型与高精度参考的设置保持独立。
+    Preserve scaling=1, k<=q, and k>q-window. Support the training and contiguous-prefill core, not cached
+    decoding, dropout, softcapping, or packed segments. Splash uses BF16 MXU precision independently of the
+    surrounding model and high-precision reference.
     """
     if q.ndim != 5 or k.ndim != 4 or k.shape != v.shape:
         raise ValueError("需要 Q[B,S,R,H,D] 和同形状 K/V[B,T,H,D]")
@@ -159,7 +161,7 @@ def attention(
         k_layout=k_layout,
         v_layout=v_layout,
     )
-    # 前后向的独立分块共用同一组输入；补齐到各阶段块长的最小公倍数。
+    # Share inputs across forward and backward block sizes, padding to their least common multiple.
     q_multiple = math.lcm(*(x for x in (blocks.block_q, blocks.block_q_dkv, blocks.block_q_dq) if x is not None))
     kv_multiple = math.lcm(*(x for x in (blocks.block_kv, blocks.block_kv_dkv, blocks.block_kv_dq) if x is not None))
     sp = (s + q_multiple - 1) // q_multiple * q_multiple
@@ -168,23 +170,23 @@ def attention(
     qp = jnp.pad(q, ((0, 0), (0, sp - s), (0, 0), (0, 0), (0, dp - d)))
     kp = jnp.pad(k, ((0, 0), (0, tp - t), (0, 0), (0, dp - d)))
     vp = jnp.pad(v, ((0, 0), (0, tp - t), (0, 0), (0, dp - d)))
-    # Splash 要求每个 KV head 的 R 个 Q heads 连续，模型的逻辑轴则是 R,H。
+    # Splash groups R consecutive query heads per KV head; the model uses logical axes R,H.
     qp = qp.transpose(0, 3, 2, 1, 4).reshape(b, h * r, sp, dp)
     kp, vp = (x.transpose(0, 2, 1, 3) for x in (kp, vp))
-    # 此控制同时改变库的输入、保存的输出及返回 cotangent 的 dtype；
-    # 不能把结果归因于某一个 residual。矩阵精度作用域仍为 BF16。
+    # This setting changes library input, saved output, and returned cotangent dtypes together.
+    # Its effect cannot be attributed to one residual; matrix precision remains BF16.
     if fp32_interface:
         qp, kp, vp = (x.astype(jnp.float32) for x in (qp, kp, vp))
 
-    # 用前缀计数识别空行，只保存 O(T+S) 数据，不创建 S*T 掩码。
+    # Detect empty rows with prefix counts, storing O(T+S) data instead of an S*T mask.
     prefix = jnp.pad(jnp.cumsum(key_mask.astype(jnp.int32), axis=1), ((0, 0), (1, 0)))
     end = query_start + jnp.arange(s) + 1
     begin = jnp.maximum(0, end - window) if window else jnp.zeros_like(end)
     nonempty = prefix[:, end] > prefix[:, begin]
     q_ids = jnp.pad(nonempty.astype(jnp.int32), ((0, 0), (0, sp - s)))
     kv_ids = jnp.pad(key_mask.astype(jnp.int32), ((0, 0), (0, tp - t)))
-    # 空行暂时匹配无效 key；它所在的绝对位置必有一个这样的 key。
-    # 随后选择模型规定的均匀结果，让这些 Splash 行收到零 cotangent。
+    # Temporarily match an empty row to the invalid key that must exist at its absolute position.
+    # Then select the model's uniform result so these Splash rows receive zero cotangent.
     static_mask = splash.LocalMask((sp, tp), (window - 1 if window else None, 0), offset=query_start)
     factory = splash.make_splash_mha_single_device
     if bf16_storage:
@@ -204,7 +206,7 @@ def attention(
     kernel = factory(splash.MultiHeadMask(tuple(static_mask for _ in range(h * r // head_splits))), block_sizes=blocks)
 
     def invoke(q, k, v, qi, ki):
-        # 外层FP32接口保留分组梯度的归约类型，内层BF16仅用于数据存储。
+        # The outer FP32 interface preserves grouped-gradient reduction precision; inner BF16 is for storage only.
         if bf16_storage:
             q, k, v = (x.astype(jnp.bfloat16) for x in (q, k, v))
         return kernel(q, k, v, segment_ids=splash.SegmentIds(qi, ki))
@@ -220,8 +222,8 @@ def attention(
         return out, pullback
 
     def one_bwd(pullback, do):
-        # 只包住前向的 context 不会约束稍后 tracing 的 custom VJP。
-        # 仍调用库自己的反向规则，不在包装层重写或额外累加梯度。
+        # A context around forward execution alone does not constrain a custom VJP traced later.
+        # Call the library's backward rule without rewriting or additionally accumulating gradients in this wrapper.
         with jax.default_matmul_precision("bfloat16"):
             return (*pullback(do), None, None)
 
@@ -229,9 +231,9 @@ def attention(
     if head_splits == 1:
         out = jax.vmap(one)(qp, kp, vp, q_ids, kv_ids)
     else:
-        # 每组均保留全部 KV heads，只切各自对应的 R 个 Q heads。
-        # 外层 vmap 产生可并行的独立组；共享 K/V 的组间 cotangent 由 JAX
-        # 汇总一次。不能直接切平坦 H*R 轴，否则 H>1 时会错配 GQA。
+        # Keep every KV head in each group, splitting only its corresponding query heads.
+        # The outer vmap creates independent groups that can run in parallel.
+        # JAX sums shared-KV cotangents once; slicing a flat H*R axis misaligns GQA when H>1.
         rp = r // head_splits
         grouped_q = qp.reshape(b, h, head_splits, rp, sp, dp).transpose(0, 2, 1, 3, 4, 5)
         grouped_q = grouped_q.reshape(b, head_splits, h * rp, sp, dp)
@@ -241,6 +243,6 @@ def attention(
         out = out.reshape(b, h * r, sp, dp)
     out = out.reshape(b, h, r, sp, dp).transpose(0, 3, 2, 1, 4)[:, :s, :, :, :d]
     out = out.astype(q.dtype)
-    # dense 的全屏蔽行先把 1/T 写成 BF16；保留这一步及其 V 梯度。
+    # Dense attention rounds 1/T to BF16 for fully masked rows; preserve that rounding and the V gradient.
     uniform = jnp.einsum("t,bthd->bhd", jnp.full((t,), 1.0 / t, q.dtype), v)
     return jnp.where(nonempty[:, :, None, None, None], out, uniform[:, None, None, :, :])

@@ -23,7 +23,7 @@ def _ready(value: Any) -> Any:
 
 
 def timed_call(fn: Callable[..., Any], *args: Any) -> tuple[Any, float]:
-    """同步执行一次；适合不能额外 warmup/update 的真实训练循环。"""
+    """Execute and wait once, without adding warmup calls or extra training updates."""
 
     start = time.perf_counter()
     result = _ready(fn(*args))

@@ -1,4 +1,4 @@
-"""检查后端选择、旧检查点兼容与显式配置错误。"""
+"""Check backend selection, legacy checkpoint compatibility, and invalid explicit settings."""
 
 from __future__ import annotations
 
@@ -95,7 +95,7 @@ def test_sft_update_preserves_backend_selection(monkeypatch, grad_tiny):
 
     def recorded(*args, backend="jax", **kwargs):
         seen.append(backend)
-        # CPU 验证完整 SFT 更新中的后端传递；不执行 TPU kernel。
+        # Check backend propagation through a complete SFT update on CPU without executing a TPU kernel.
         return per_token_logps(*args, backend="jax", **kwargs)
 
     monkeypatch.setattr(losses, "per_token_logps", recorded)

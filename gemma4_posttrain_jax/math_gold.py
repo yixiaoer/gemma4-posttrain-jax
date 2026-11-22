@@ -1,4 +1,4 @@
-"""MATH 训练数据的答案修正。修正依据原题，使用前核对题目和解答的校验值。"""
+"""Correct MATH training answers from the original questions, checking question and solution hashes before use."""
 
 from typing import NamedTuple
 
@@ -10,7 +10,7 @@ class GoldCorrection(NamedTuple):
     reason: str
 
 
-# 空answers是有记录的评分能力排除；多个answers表示任选其一，单个集合表达式要求全部成员。
+# Empty answers mark unsupported scoring; multiple answers are alternatives, while one set requires every member.
 MATH_GOLD_CORRECTIONS = {
     "train/algebra/row_334": GoldCorrection(
         "f03b90f3870b9bb19b331275c07cfa564903883542a6b5a528db711e0b402974",

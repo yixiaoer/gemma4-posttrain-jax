@@ -1,4 +1,6 @@
-"""在完整tiny模型上比较各目标的dense oracle与微批梯度/Adam，TPU另行执行。"""
+"""Compare full-batch references with microbatch gradients and Adam updates on complete tiny models; test TPU
+separately.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +19,9 @@ ALGORITHMS = ("grpo", "drgrpo", "dapo", "gspo-token", "rloo")
 
 
 def _check_adam_invariants(initial, actual, expected_gradient, grad_norm: float) -> tuple[float, int]:
-    """从实际融合动量恢复梯度并独立核对首步Adam；不把近零梯度的符号当稳定oracle。"""
+    """Recover gradients from actual fused moments and check the first Adam update independently, allowing unstable
+    signs near zero.
+    """
 
     adam = actual.opt_state[2].inner_state[0]
     assert int(adam.count) == 1
@@ -42,7 +46,8 @@ def _check_adam_invariants(initial, actual, expected_gradient, grad_norm: float)
         error2 += np.square(delta).sum()
         reference2 += np.square(reference[path]).sum()
         strict_mismatches += int(np.count_nonzero(np.abs(delta) > 1e-6 + 1e-4 * np.abs(reference[path])))
-        # 第一轮零初态、无weight decay：NumPy f64公式独立检查两个动量和完整master更新。
+        # With zero initial state and no weight decay, use NumPy FP64 to check both moments and the full master
+        # update.
         np.testing.assert_allclose(v, np.square(m / 0.1) * 0.001, atol=1e-20, rtol=1e-5)
         expected_parameter = value - 1e-3 * (m / 0.1) / (np.sqrt(v / 0.001) + 1e-8)
         np.testing.assert_allclose(result[path], expected_parameter, atol=1e-7, rtol=1e-6)
@@ -62,7 +67,7 @@ def _check_objective_update(fixture, algorithm: str, *, distributed: bool) -> No
     options = {name: value for name, value in objective._asdict().items() if name != "advantage_estimator"}
     advantage = objective_advantages(jnp.asarray([0.1, 1.1] * 4), 2, objective.advantage_estimator)
     initial_logps = jax.jit(lambda p: _dense_completion_logps(p, config, *tokens))(params)
-    # 两个正负方向均覆盖裁剪区；离边界足够远，避免把舍入引起的分支变化当作数学误差。
+    # Cover clipping for both advantage signs, staying away from boundaries where rounding can change the branch.
     shift = jnp.asarray([0.5, 0.5, -0.5, -0.5] * 2)[:, None]
     old = None if algorithm == "rloo" else initial_logps - shift * tokens[-1]
     beta = 0.04 if algorithm == "grpo" else 0.0
@@ -81,7 +86,7 @@ def _check_objective_update(fixture, algorithm: str, *, distributed: bool) -> No
         policy = _dense_completion_logps(effective, config, *tokens)
         return grpo_loss(policy, old, reference, advantage, tokens[-1], beta=beta, **options)[0]
 
-    # 采用已有完整梯度gate的grad-only JIT参考边界，loss单独比较。
+    # Use the established gradient-only JIT reference and compare loss separately.
     expected_gradient = jax.jit(jax.grad(dense_objective))(params)
     expected_loss = jax.jit(dense_objective)(params)
 
@@ -129,7 +134,7 @@ def _check_objective_update(fixture, algorithm: str, *, distributed: bool) -> No
     captured, metrics = jax.jit(lambda state: update(state, collector, micro))(capture_state)
     micro_difference = jax.tree.map(jnp.subtract, captured.opt_state, gradient)
     micro_relative_l2 = float(optax.tree.norm(micro_difference) / optax.tree.norm(gradient))
-    # 跨batch shape沿用微批gate的全局梯度/完整Adam口径；另记录严格逐元素差异，不掩盖舍入尾部。
+    # Compare global gradients and full Adam state across batch shapes, also recording strict elementwise differences.
     assert micro_relative_l2 < 1e-4
     strict_mismatches = sum(
         int(np.count_nonzero(np.abs(np.asarray(a) - np.asarray(b)) > 1e-6 + 1e-4 * np.abs(np.asarray(b))))
@@ -138,7 +143,7 @@ def _check_objective_update(fixture, algorithm: str, *, distributed: bool) -> No
     np.testing.assert_allclose(metrics.loss_metrics.loss, expected_loss, atol=3e-6, rtol=3e-6)
     expected_state = jax.jit(dense_update)(initial)
     actual_state, actual_metrics = jax.jit(lambda state: update(state, optimizer, micro))(initial)
-    # 保留原跨shape参数判据的失败计数；近零梯度经Adam放大时，它不是可靠的正确性gate。
+    # Retain strict parameter mismatch counts; Adam amplification near zero makes them an unreliable sole criterion.
     parameter_mismatches = sum(
         int(np.count_nonzero(np.abs(np.asarray(a) - np.asarray(b)) > 2e-5 + 3e-4 * np.abs(np.asarray(b))))
         for a, b in zip(jax.tree.leaves(actual_state.params_f32), jax.tree.leaves(expected_state[0]), strict=True)

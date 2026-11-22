@@ -1,4 +1,4 @@
-"""LoRA训练的冻结基础模型身份与小型Adam；复用原GRPO/完整状态格式。"""
+"""Track frozen base identity and adapter-only Adam state while reusing GRPO and the full-state checkpoint format."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def make_lora_optimizer(learning_rate: float, *, max_grad_norm: float = 1.0) -> 
 
 
 def lora_base_identity(model_path: Path) -> dict[str, dict[str, str | int]]:
-    """保存全文件字节身份；仅路径相同不能证明恢复时冻结base或tokenizer未变。"""
+    """Hash complete files; matching paths alone cannot prove that frozen weights or the tokenizer are unchanged."""
     weights = sorted(model_path.glob("*.safetensors"))
     if not weights or not (model_path / "config.json").is_file():
         raise ValueError("LoRA需要明确的HF config与safetensors基础权重")
@@ -51,7 +51,7 @@ def lora_base_identity(model_path: Path) -> dict[str, dict[str, str | int]]:
 
 
 def checkpoint_lora_config(run_config: Mapping[str, Any] | None, model_path: Path) -> LoRAConfig | None:
-    """独立评估加载前核对LoRA格式、缩放/精度协议及全部冻结base字节。"""
+    """Check LoRA format, scaling, precision, and all frozen base bytes before loading for independent evaluation."""
     if run_config is None or "training_mode" not in run_config:
         return None
     expected = {

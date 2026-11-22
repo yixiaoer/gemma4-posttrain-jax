@@ -157,7 +157,7 @@ def _vocab_parallel_logps(
     vocab_chunk: int,
     sequence_chunk: int,
 ) -> Array:
-    """保留词表分片，返回所选 token 的 logprob。"""
+    """Return selected-token logprobs while retaining vocabulary sharding."""
     return _vocab_parallel_logps_and_normalization(
         embed_tokens,
         hidden,
@@ -179,7 +179,7 @@ def _vocab_parallel_logps_and_normalization(
     vocab_chunk: int,
     sequence_chunk: int,
 ) -> tuple[Array, Array]:
-    """保留原生浮点顺序，并额外返回全局 maximum/sum。"""
+    """Preserve the native floating-point order and also return the global maximum and sum."""
 
     if DATA_AXIS not in mesh.axis_names:
         raise ValueError(f"vocab-parallel mesh needs axis {DATA_AXIS!r}: {mesh.axis_names}")
@@ -315,7 +315,9 @@ def per_token_logps(
     mesh: Mesh | None = None,
     backend: str = "jax",
 ) -> Array:
-    """按显式后端计算 selected logprob；默认保持原生流式词表并行。"""
+    """Compute selected-token logprobs with the requested backend, defaulting to native streamed vocabulary
+    parallelism.
+    """
     if backend == "jax":
         return _jax_per_token_logps(
             embed_tokens,
@@ -362,7 +364,7 @@ def compute_advantages(rewards: Array, group_size: int, *, normalize_std: bool =
         raise ValueError(f"reward count {rewards.size} is not divisible by group_size={group_size}")
     output_shape = rewards.shape
     grouped = rewards.astype(jnp.float32).reshape(-1, group_size)
-    # 先减组内锚点，再求均值/标准差，避免常量组的均值舍入残差被 1e-6 放大。
+    # Subtract a group anchor before mean/std reduction, avoiding amplified rounding residuals in constant groups.
     shifted = grouped - grouped[:, :1]
     centered = shifted - shifted.mean(axis=-1, keepdims=True)
     if normalize_std:
@@ -423,7 +425,7 @@ def _masked_mean(values: Array, mask: Array) -> Array:
 
 
 def _stable_k3(difference: Array) -> Array:
-    """避免接近零时的相减误差，以及未选中多项式分支的梯度溢出。"""
+    """Avoid cancellation near zero and gradient overflow in an unselected polynomial branch."""
 
     small = jnp.abs(difference) <= 0.01
     local = jnp.where(small, difference, 0.0)
@@ -442,8 +444,9 @@ def _kl_estimate(
     if estimator in ("k3", "low_var_kl"):
         difference = reference_logps - policy_logps
         if clamp_value is not None:
-            # 比此值更大的下一个FP32数，其指数已经超出FP32范围。
-            # 先隔离溢出分支，避免最终clip的零梯度乘上无穷大而产生NaN。
+            # The next larger FP32 value already has an exponential outside the FP32 range.
+            # Isolate the overflow branch before clipping so a zero derivative cannot multiply infinity and produce
+            # NaN.
             max_log = jnp.nextafter(jnp.log(jnp.finfo(jnp.float32).max), -jnp.inf)
             overflow = difference > max_log
             safe_difference = jnp.where(overflow, 0.0, difference)
@@ -537,7 +540,7 @@ def grpo_loss(
     dual_clipfrac = _masked_mean(jnp.broadcast_to(dual_applies, policy.shape).astype(jnp.float32), mask)
     per_token_policy = jnp.where(advantage < 0.0, jnp.minimum(dual_bound, per_token_policy), per_token_policy)
     if sampler_is_weights is not None:
-        # 冻结的采样修正只乘policy目标，不乘独立KL正则项。
+        # Apply fixed sampling corrections to the policy objective only, not the separate KL term.
         per_token_policy = per_token_policy * lax.stop_gradient(sampler_is_weights.astype(jnp.float32))
     policy_loss = aggregate_token_loss(per_token_policy, mask, agg_mode, token_scale=token_scale)
 
@@ -689,7 +692,7 @@ def truncated_importance_weights(
     *,
     cap: float,
 ) -> Array:
-    """固定target-old / behavior的逐token截断权重；不是完整轨迹的无偏IS。"""
+    """Fix capped per-token target-old/behavior weights; this is not unbiased full-trajectory importance sampling."""
     if not math.isfinite(cap) or cap <= 0:
         raise ValueError("IS cap必须为正的有限数")
     if (
@@ -699,8 +702,8 @@ def truncated_importance_weights(
     ):
         raise ValueError("old/behavior logps与completion mask必须共享[B,N]")
     difference = old_trainer_logps.astype(jnp.float32) - behavior_logps.astype(jnp.float32)
-    # 在exp之前施加上限；不额外引入未声明的下限裁剪。
-    # TPU默认exp在真实TIS输入上偏差约3e-6；只固定此冻结权重的指数精度。
+    # Apply the upper cap before exp without introducing an undeclared lower clip.
+    # Default TPU exp differed by about 3e-6 on measured TIS inputs; fix precision only for these frozen weights.
     weights = lax.exp(
         jnp.minimum(difference, jnp.log(jnp.asarray(cap, jnp.float32))), accuracy=lax.AccuracyMode.HIGHEST
     )
@@ -745,7 +748,9 @@ def grpo_train_step[Params](
     frozen_base: Gemma4TextParams | None = None,
     lora_config: LoRAConfig | None = None,
 ) -> tuple[TrainState[Params], GRPOTrainMetrics]:
-    """固定token的一次FP32 master更新；可从同一联合图捕获轮内冻结old概率。"""
+    """Update the FP32 master once on fixed tokens, optionally capturing fixed old-policy probabilities from the
+    same graph.
+    """
 
     if lora_config is None:
         if frozen_base is not None or trainable_mask is None or not isinstance(state.params_f32, Gemma4TextParams):
@@ -784,7 +789,8 @@ def grpo_train_step[Params](
     def loss_from_logps(policy: Array, batch: Any) -> tuple[Array, GRPOMetrics]:
         old = batch[5]
         if use_current_policy_as_old is not None:
-            # 只在首个update取当前联合前向；old分母与IS均不得反向传播。
+            # Capture the joint forward pass only on the first update; stop gradients through old probabilities and IS
+            # weights.
             old = jnp.where(use_current_policy_as_old, lax.stop_gradient(policy), old)
         is_weights = batch[8]
         if sampler_is_cap is not None:
@@ -818,7 +824,8 @@ def grpo_train_step[Params](
                 trainable_mask,
             )
         else:
-            # AD只接受A/B为变量；base显式作为调用参数传入，不建立基础模型梯度或Adam槽。
+            # Differentiate only A and B; pass the frozen base explicitly without creating its gradients or Adam
+            # slots.
             effective_params = jax.tree.map(lax.stop_gradient, frozen_base)
             lora = prepare_lora_params(cast(Gemma4LoRAParams, params), lora_config)
         policy_logps = trainer_completion_logps(
@@ -845,7 +852,8 @@ def grpo_train_step[Params](
                 state.params_f32, tokens, jnp.ones((), jnp.float32)
             )
         else:
-            # 优势在完整 G 组上先计算；这里只分行求梯度。按全局分母缩放，不能平均各微批均值。
+            # Compute advantages over complete groups first; accumulate row gradients using the global loss
+            # denominator.
             denominator = _loss_denominator(effective_loss_mask, agg_mode)
 
             def accumulate(total: Params, index: Array) -> tuple[Params, Array]:
@@ -857,7 +865,7 @@ def grpo_train_step[Params](
             zero_grads = jax.tree.map(jnp.zeros_like, state.params_f32)
             grads, logps_blocks = lax.scan(accumulate, zero_grads, jnp.arange(rows // microbatch_size))
             policy_logps = logps_blocks.reshape(completion_ids.shape)
-        # 仅保留 [B,N] 概率供全局指标归约，不保留各微批激活或 [B,N,V] logits。
+        # Keep only [B,N] probabilities for global metrics, not per-microbatch activations or [B,N,V] logits.
         loss, loss_metrics = loss_from_logps(policy_logps, tokens)
     with jax.named_scope("optimizer_update"):
         grad_norm = optax.tree.norm(grads)

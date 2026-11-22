@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 用内置问答连续训练 4 步，检查训练流程；每步都计算梯度并由 Adam 修改参数。
+# Run four updates on a built-in question and answer to check gradient computation and Adam state updates.
 set -euo pipefail
 model_path=${1:?用法: e2b_sft_smoke.sh HF_SNAPSHOT NEW_OUTPUT_DIR}
 output_root=${2:?需要新的输出目录}

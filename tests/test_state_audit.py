@@ -1,4 +1,4 @@
-"""恢复摘要必须覆盖每个参数/Adam叶，且不能漏掉单叶改变和非有限状态。"""
+"""Cover every parameter and Adam leaf in recovery hashes, detecting single-leaf changes and nonfinite values."""
 
 import numpy as np
 

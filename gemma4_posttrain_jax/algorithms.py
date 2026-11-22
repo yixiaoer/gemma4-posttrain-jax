@@ -1,4 +1,4 @@
-"""GRPO族的显式目标配置、冻结IS权重和生成/loss mask边界。"""
+"""Configure GRPO-family objectives, fixed importance weights, and generation and loss masks."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ class ObjectiveConfig(NamedTuple):
 
 
 def objective_for_algorithm(name: AlgorithmName, *, generation_budget: int) -> ObjectiveConfig:
-    """只解析优势与loss；DAPO的动态采样/超长过滤仍须由host训练循环实现。"""
+    """Resolve advantages and loss settings; the host loop handles DAPO resampling and length filtering."""
     if generation_budget <= 0:
         raise ValueError("generation_budget必须为正")
     baseline = ObjectiveConfig()
@@ -58,7 +58,7 @@ def objective_advantages(rewards: Array, group_size: int, estimator: AdvantageEs
 
 
 def completion_loss_mask(completion_mask: Array, truncated: Array, *, filter_truncated: bool) -> Array:
-    """只决定哪些token参与loss；trainer的上下文仍使用原始生成mask。"""
+    """Select tokens for the loss while preserving the original generation mask for model context."""
     if completion_mask.ndim != 2 or truncated.shape != (completion_mask.shape[0],):
         raise ValueError("需要[B,N]生成mask与[B]截断标记")
     return completion_mask.astype(jnp.bool_) & (~truncated[:, None] if filter_truncated else True)
@@ -67,7 +67,7 @@ def completion_loss_mask(completion_mask: Array, truncated: Array, *, filter_tru
 def validate_update_schedule(
     *, updates_per_rollout: int, max_steps: int, eval_every: int, save_every: int, start_step: int = 0
 ) -> None:
-    """仅在完整rollout的μ次更新边界评估/保存，恢复无需保存半轮batch。"""
+    """Evaluate and save after all updates for a rollout, so recovery needs no unfinished training batch."""
     if updates_per_rollout <= 0 or max_steps <= 0 or min(eval_every, save_every, start_step) < 0:
         raise ValueError("μ和目标步数必须为正，间隔和起始步数不能为负")
     if any(value % updates_per_rollout for value in (max_steps, eval_every, save_every, start_step)):
@@ -75,7 +75,7 @@ def validate_update_schedule(
 
 
 def mixed_success_groups(task_success: np.ndarray, group_size: int) -> np.ndarray:
-    """Host侧整组过滤，只接收0/1任务成功，不把格式或长度奖励当作成功率。"""
+    """Filter whole groups by binary task success, excluding format and length rewards from success rates."""
     success = np.asarray(task_success)
     if success.ndim != 1 or group_size < 2 or success.size % group_size:
         raise ValueError("task_success必须是一维连续G组")

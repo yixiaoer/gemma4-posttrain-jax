@@ -1,4 +1,4 @@
-"""固定 GSM8K/MATH 留出集评估；补齐行不进入指标，不改变训练状态或随机流。"""
+"""Evaluate fixed GSM8K/MATH holdouts, excluding padded rows and preserving training state and RNG."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from .sharding import batch_spec, named_shardings, param_specs_rollout
 class EvalBatch(NamedTuple):
     prompt_ids: np.ndarray
     prompt_mask: np.ndarray
-    indices: tuple[int, ...]  # 只包含有效行；设备 batch 的尾部重复不计入结果
+    indices: tuple[int, ...]  # Valid rows only; repeated device-padding rows are excluded.
     golds: tuple[Gold, ...]
     source_ids: tuple[str, ...] | None = None
 
@@ -40,7 +40,7 @@ class EvaluationData(NamedTuple):
 
 
 def indices_sha256(indices: Sequence[int]) -> str:
-    """与训练 run_config 相同的 little-endian int64 题号身份。"""
+    """Hash question indices as little-endian int64, matching the training run_config."""
     return hashlib.sha256(np.asarray(indices, dtype="<i8").tobytes()).hexdigest()
 
 
@@ -54,7 +54,7 @@ def load_evaluation_data(
     dev_seed: int = 0,
     checkpoint_run_config: Mapping[str, Any] | None = None,
 ) -> EvaluationData:
-    """在加载模型前固定题目；train-dev 必须与 checkpoint 的实际排除集合一致。"""
+    """Fix questions before loading the model; train-dev must match the checkpoint's actual exclusion set."""
     if dataset_name not in ("gsm8k", "math"):
         raise ValueError("评估 dataset 只能是 gsm8k 或 math")
     subset = subset or ("math500" if dataset_name == "math" else "test-monitor")
@@ -79,7 +79,7 @@ def load_evaluation_data(
                 "train_indices_sha256": indices_sha256(train),
                 "dev_indices_sha256": indices_sha256(held_out),
             }
-            # 旧 GSM8K checkpoint 尚无 dataset 字段；其它身份项不能靠默认值补造。
+            # Legacy GSM8K checkpoints lack a dataset field; do not infer other identity fields from defaults.
             if checkpoint_run_config.get("dataset", "gsm8k") != dataset_name or any(
                 checkpoint_run_config.get(key) != value for key, value in expected.items()
             ):
@@ -90,7 +90,7 @@ def load_evaluation_data(
         if len(indices) != size:
             raise ValueError("评估 size 超过 train-dev 留出子集")
     elif subset == "test-unused":
-        # 排除 Phase4 已监测的固定 test500/seed0；eval seed 只改变剩余题顺序。
+        # Exclude the previously monitored test500/seed0 subset; eval seed only reorders the remaining questions.
         remaining, _ = split_holdout_indices(len(dataset), 500, seed=0)
         indices = eval_subset(remaining, size=size, seed=seed)
     else:
@@ -99,7 +99,7 @@ def load_evaluation_data(
 
 
 def resolve_eval_prompt_style(requested: str | None, run_config: Mapping[str, Any] | None) -> str:
-    """省略参数时继承checkpoint；旧checkpoint固定chat，拒绝改变已训练模板。"""
+    """Inherit the checkpoint's prompt template; legacy checkpoints use chat and cannot switch templates."""
     saved = None if run_config is None else run_config.get("prompt_style", "chat")
     if saved is not None and saved not in ("chat", "plain"):
         raise ValueError("checkpoint的prompt style不受支持")
@@ -113,18 +113,49 @@ def resolve_eval_prompt_style(requested: str | None, run_config: Mapping[str, An
 
 
 def resolve_eval_rollout_layout(requested: str | None, run_config: Mapping[str, Any] | None) -> str:
-    """默认继承训练布局；显式覆盖用于登记后的布局系统对照。"""
+    """Inherit the training layout unless explicitly overridden for a separate layout comparison."""
     saved = "replicated" if run_config is None else run_config.get("rollout_layout", "replicated")
-    if saved not in ("replicated", "fsdp") or requested not in (None, "replicated", "fsdp"):
-        raise ValueError("rollout layout只能为replicated或fsdp")
+    if saved not in ("replicated", "fsdp", "tp") or requested not in (None, "replicated", "fsdp", "tp"):
+        raise ValueError("rollout layout只能为replicated、fsdp或tp")
     return requested or saved
 
 
 def make_eval_sampler(
-    config: Gemma4TextConfig, sampler_config: SamplerConfig, mesh: Mesh, *, rollout_layout: str = "replicated"
+    config: Gemma4TextConfig,
+    sampler_config: SamplerConfig,
+    mesh: Mesh,
+    *,
+    rollout_layout: str = "replicated",
+    param_tree: Any | None = None,
+    tp_allreduce: str = "xla",
+    tp_prefill_widths: tuple[int, ...] = (),
+    tp_decode_kernel: bool = False,
 ) -> Any:
+    """Use param_tree to derive TP parameter shards; it is required only for rollout_layout="tp"."""
     if sampler_config.temperature != 0:
         raise ValueError("当前固定评估使用 greedy；不要把随机采样与 greedy 准确率混为一谈")
+    if rollout_layout == "tp":
+        from gemma4_posttrain_jax.tp_rollout import attention_rows, make_tp_mesh, tp_generate, tp_param_specs
+
+        if param_tree is None:
+            raise ValueError("TP 评估需要 param_tree")
+        tp_mesh = make_tp_mesh(1, mesh.size, list(mesh.devices.flat))
+        specs = tp_param_specs(param_tree, attention_rows=attention_rows(tp_allreduce))
+        return jax.jit(
+            lambda params, ids, mask, key: tp_generate(
+                params,
+                config,
+                ids,
+                mask,
+                sampler_config=sampler_config,
+                key=key,
+                mesh=tp_mesh,
+                param_specs=specs,
+                allreduce=tp_allreduce,
+                prefill_widths=tp_prefill_widths,
+                decode_kernel=tp_decode_kernel,
+            )
+        )
     batch = NamedSharding(mesh, batch_spec(2))
     return jax.jit(
         lambda params, ids, mask, key: generate(
@@ -181,7 +212,7 @@ def prepare_eval_batches(
             ids[row, -len(tokens) :] = tokens
             mask[row, -len(tokens) :] = True
             golds.append(example_gold(dataset[index]))
-        # 使用合法 prompt 补齐设备形状，返回的 indices/golds 仍只有有效行。
+        # Pad device batches with valid prompts, but return indices and answers only for genuine rows.
         ids[len(selected) :] = ids[len(selected) - 1]
         mask[len(selected) :] = mask[len(selected) - 1]
         selected_sources = tuple(str(value) for value in source_ids[start : start + len(selected)])
@@ -202,7 +233,7 @@ def evaluate_batches(
     seed: int = 0,
     executor: Executor | None = None,
 ) -> dict[str, Any]:
-    """调用预编译的 greedy sampler；不接收 TrainState，也不复用训练 key。"""
+    """Call a compiled greedy sampler without accepting TrainState or reusing a training RNG key."""
 
     if not batches:
         raise ValueError("评估 batch 不能为空")
@@ -233,7 +264,8 @@ def evaluate_batches(
                     "dataset_index": batch.indices[row],
                     "gold": batch.golds[row],
                     "completion": text,
-                    # 从实际输入/输出取ID；保留有效EOS及pad值，不能由解码文本重新分词补造。
+                    # Use actual token IDs, preserving valid EOS and pad values; do not reconstruct them by tokenizing
+                    # text.
                     "prompt_token_ids": batch.prompt_ids[row, batch.prompt_mask[row]].tolist(),
                     "completion_token_ids": ids[row, : int(lengths[row])].tolist(),
                     "length": int(lengths[row]),

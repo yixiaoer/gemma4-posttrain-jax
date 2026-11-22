@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""在独立进程中测量Gemma 4 E2B纯JAX批量rollout的吞吐和内存。"""
+"""Measure Gemma 4 E2B native JAX batch-generation throughput and memory in a separate process."""
 
 from __future__ import annotations
 

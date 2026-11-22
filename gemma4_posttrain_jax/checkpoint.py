@@ -20,9 +20,9 @@ import numpy as np
 from safetensors import safe_open
 from safetensors.numpy import save
 
-# gemma4_posttrain_jax 的完整训练状态格式。
+# Full training-state format used by gemma4_posttrain_jax.
 FORMAT_NAME = "gemma4_posttrain_jax-train-state"
-# 兼容读取初版文件；保存新文件时使用 FORMAT_NAME。
+# Read the original format for compatibility; write new checkpoints with FORMAT_NAME.
 LEGACY_FORMAT_NAMES = frozenset({"gemma4-rl-jax-train-state"})
 FORMAT_VERSION = 1
 _CHECKPOINT_CHUNK_BYTES = 64 * 2**20
@@ -50,7 +50,7 @@ def _jsonable(value: Any) -> Any:
 
 @lru_cache
 def _safetensors_dtype(dtype: np.dtype) -> str:
-    """让已安装的safetensors验证dtype，并从空数组取得格式中的dtype名称。"""
+    """Let safetensors validate the dtype and obtain its format name from an empty array."""
 
     encoded = save({"array": np.empty((0,), dtype=dtype)})
     header_size = int.from_bytes(encoded[:8], "little")
@@ -59,7 +59,7 @@ def _safetensors_dtype(dtype: np.dtype) -> str:
 
 @jax.jit(static_argnums=(2, 3))
 def _checkpoint_slice(value: jax.Array, starts: tuple, sizes: tuple, local_shape: tuple) -> jax.Array:
-    """在单个本地分片上取连续块；浮点数以整数编码返回，避免数值转换。"""
+    """Read a contiguous block from one local shard, returning float bit patterns without numeric conversion."""
     result = jax.lax.dynamic_slice(value.reshape(local_shape), starts, sizes)
     dtype = np.dtype(value.dtype)
     if dtype.kind == "f" or dtype == jnp.bfloat16:
@@ -68,7 +68,7 @@ def _checkpoint_slice(value: jax.Array, starts: tuple, sizes: tuple, local_shape
 
 
 def iter_host_array_blocks(leaf: Any, *, max_bytes: int = _CHECKPOINT_CHUNK_BYTES) -> Generator[np.ndarray, None, None]:
-    """按全局C顺序读回有界数据块；调用方处理后释放当前块，异常时关闭迭代器。"""
+    """Yield bounded blocks in global C order; release each after use and close the iterator on failure."""
     if not isinstance(leaf, jax.Array):
         leaf = np.asarray(leaf)
     dtype = np.dtype(leaf.dtype)
@@ -89,8 +89,8 @@ def iter_host_array_blocks(leaf: Any, *, max_bytes: int = _CHECKPOINT_CHUNK_BYTE
             if temporary is not None:
                 temporary.delete()
         return
-    # 前面的维度逐个遍历，当前维度分块，后面的维度保持完整。
-    # 每块对应文件中连续的一段，既支持很宽的矩阵，也支持高维参数。
+    # Iterate over preceding axes, chunk the current axis, and keep subsequent axes intact.
+    # Each block is contiguous in the file, including blocks from wide matrices or higher-rank parameters.
     budget = max_bytes // dtype.itemsize
     axis = 0
     while math.prod(shape[axis + 1 :]) > budget:
@@ -147,7 +147,7 @@ def iter_host_array_blocks(leaf: Any, *, max_bytes: int = _CHECKPOINT_CHUNK_BYTE
 
 
 def _write_leaf(file: BinaryIO, leaf: Any) -> None:
-    """按最多64MiB的逻辑连续块写入，不在主机拼接完整的大参数。"""
+    """Write contiguous logical blocks of at most 64 MiB without assembling the full parameter on the host."""
     with closing(iter_host_array_blocks(leaf, max_bytes=_CHECKPOINT_CHUNK_BYTES)) as blocks:
         for block in blocks:
             if not block.dtype.isnative:
@@ -161,7 +161,7 @@ def _write_leaf(file: BinaryIO, leaf: Any) -> None:
 
 
 def _save_arrays(names: list[str], leaves: list[Any], path: Path) -> list[dict[str, Any]]:
-    """逐张量写标准safetensors；头部仅依赖shape/dtype，不收集全量主机数组。"""
+    """Write standard safetensors one array at a time; build the header from shapes and dtypes only."""
 
     header: dict[str, Any] = {"__metadata__": {"format": FORMAT_NAME}}
     offset = 0
@@ -196,10 +196,11 @@ def _save_arrays(names: list[str], leaves: list[Any], path: Path) -> list[dict[s
 
 
 def save_train_state(state: Any, path: str | os.PathLike[str], *, metadata: Mapping[str, Any]) -> Path:
-    """逐张量保存完整训练状态，最后原子地发布checkpoint目录。
+    """Save training state one array at a time, then atomically publish the checkpoint directory.
 
-    不覆盖已有目录，保持版本1的文件格式。大参数按最多64MiB分块，
-    主机保留当前块及一个分片读回缓冲；tmpfs文件仍占用主机物理内存。
+    Preserve the version 1 format and refuse to overwrite an existing directory. Large arrays use blocks of at
+    most 64 MiB. Host memory holds the current block and one shard readback buffer; files on tmpfs also consume
+    physical host memory.
     """
 
     target = Path(path)
@@ -275,7 +276,7 @@ def load_train_state[T](
             missing = sorted(set(names) - set(stored.keys()))
             extra = sorted(set(stored.keys()) - set(names))
             raise ValueError(f"checkpoint pytree keys differ: missing={missing} extra={extra}")
-        # 先检查全部数组的形状和类型，再分配设备内存。
+        # Validate every shape and dtype before allocating device memory.
         for name, template_leaf in zip(names, template_leaves, strict=True):
             signature = stored.get_slice(name)
             shape, dtype = tuple(signature.get_shape()), signature.get_dtype()
@@ -296,7 +297,7 @@ def load_train_state[T](
                 array = stored.get_tensor(name)
                 restored = jnp.asarray(array) if sharding is None else jax.device_put(array, sharding)
                 restored_leaves.append(restored)
-                # 等待当前传输结束，避免异步队列同时保留所有主机数组。
+                # Wait for this transfer so the dispatch queue does not retain all host arrays at once.
                 restored.block_until_ready()
                 del array
         except BaseException:

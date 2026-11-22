@@ -1,4 +1,4 @@
-"""完整答案集合不能用单个成员得分；任选一题也不能提交两个答案。"""
+"""Require all members of a set answer, and reject multiple submitted answers when only one alternative is allowed."""
 
 import pytest
 from test_data import FakeTokenizer

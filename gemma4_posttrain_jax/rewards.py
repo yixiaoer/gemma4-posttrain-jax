@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 import numpy as np
 
-# 一个字符串可表示完整集合；元组表示题目允许任选一个完整答案。
+# A string can represent a complete set; a tuple lists acceptable alternative answers.
 Gold = str | tuple[str, ...]
 
 
@@ -89,7 +89,7 @@ def score_completions(
     elif workers == 1:
         rows = list(map(_score_one, arguments))
     else:
-        # JAX runtime 已有线程；fork 会复制不完整的线程/锁状态。
+        # JAX has already started threads; fork would copy incomplete thread and lock state.
         with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as pool:
             rows = list(pool.map(_score_one, arguments))
     if not rows:

@@ -1,6 +1,7 @@
-"""固定推理环境的本机Unix socket服务；完整参数收妥与设备版本提交分开确认。
+"""Serve a pinned inference environment over a local Unix socket.
 
-导入时不初始化JAX；实际引擎由独立进程在指定物理芯片上构造。
+Acknowledge complete parameter receipt separately from committing a device version. Importing this module does
+not initialize JAX; a separate process constructs the engine on the requested physical chips.
 """
 
 from __future__ import annotations
@@ -70,7 +71,7 @@ def receive_parameters(
         hash_s += time.perf_counter() - start
         leaves.append(leaf)
         received.append({"index": record["index"], "path": record["path"], "bytes": len(raw), "sha256": digest})
-        # 只证明接收方host数组已持有完整副本；尚未提交推理设备参数。
+        # Confirm a complete host copy on the receiver; the inference device version is not yet committed.
         send_control(connection, {"status": "host_received", "index": record["index"], "sha256": digest})
     return rebuild_tree(descriptor, leaves), {
         "protocol": PROTOCOL,
@@ -86,7 +87,7 @@ def receive_parameters(
 
 
 def open_accel_devices() -> list[str]:
-    """从本进程的文件描述符观察实际设备，环境声明单独记录。"""
+    """Inspect actual device file descriptors in this process and record environment settings separately."""
     devices = set()
     for fd in Path("/proc/self/fd").iterdir():
         try:
@@ -99,7 +100,7 @@ def open_accel_devices() -> list[str]:
 
 
 def snapshot_device_memory(devices: list[Any], stage: str) -> dict[str, Any]:
-    """记录当前进程的真实设备计数器；不把缺失峰值当成零或核函数独占用量。"""
+    """Read actual process device counters; a missing peak is neither zero nor a kernel-specific measurement."""
     started = time.perf_counter()
     rows = []
     for device in devices:
@@ -111,7 +112,7 @@ def snapshot_device_memory(devices: list[Any], stage: str) -> dict[str, Any]:
                 required = [stats.get(name) for name in ("bytes_in_use", "peak_bytes_in_use")]
                 row["available"] = all(type(value) is int and value >= 0 for value in required)
         except Exception as error:
-            # 诊断失败独立记录，不撤销已经完成的参数事务或生成结果。
+            # Record diagnostic failures separately from completed parameter transactions and generation results.
             row["error"] = {"type": type(error).__name__, "message": str(error)}
         rows.append(row)
     return {
@@ -317,7 +318,7 @@ def serve(path: Path, engine_config: EngineConfig, record_path: Path) -> None:
 
 
 def inspect_environment() -> dict[str, Any]:
-    """CPU预检实际目标解释器/安装源/库选择；实际TPU映射仍由构造引擎时另核。"""
+    """Check the target interpreter, installed sources, and library selection on CPU; verify TPU mapping at startup."""
     from jax._src.cloud_tpu_init import get_tpu_library_path
 
     from .inference_runtime import EXPECTED_LIBTPU_SHA256, EXPECTED_SOURCE_SHA256, EXPECTED_VERSIONS, file_sha256

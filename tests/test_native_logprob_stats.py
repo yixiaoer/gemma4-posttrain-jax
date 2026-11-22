@@ -1,4 +1,4 @@
-"""检查额外导出归一化统计是否保持原生概率和两路 VJP。"""
+"""Check that additional normalization statistics preserve native logprobs and both VJPs."""
 
 from __future__ import annotations
 

@@ -177,7 +177,9 @@ def test_generate_is_reproducible_for_fixed_key(tiny_a, temperature, top_k, top_
     [(1.0, 0, 1.0), (0.7, 0, 1.0), (0.8, 3, 1.0), (0.8, 0, 0.85), (0.8, 4, 0.7), (0.8, 0, 1e-50)],
 )
 def test_sampling_distribution_matches_transformers_and_keeps_raw_logprob(temperature, top_k, top_p):
-    """用独立Torch过滤器验证候选集合和频率，检查记录的仍是完整策略概率。"""
+    """Use an independent Torch filter to check candidates and frequencies, while recording full-policy
+    probabilities.
+    """
     from transformers.generation.logits_process import (
         TemperatureLogitsWarper,
         TopKLogitsWarper,
@@ -206,8 +208,8 @@ def test_sampling_distribution_matches_transformers_and_keeps_raw_logprob(temper
 
 
 def test_top_p_includes_threshold_crossing_token():
-    # 0.5+0.3超过0.6时应保留前两项，不能只保留最高项或把第三项也加入。
-    # 在CPU构造固定logits，避免把TPU默认log的误差混入采样器的输入。
+    # With p=0.6, retain 0.5 and 0.3: the first two tokens cross the threshold, and the third must be excluded.
+    # Build fixed logits on CPU so TPU's default log approximation does not alter sampler inputs.
     values = jnp.broadcast_to(jnp.asarray(np.log(np.asarray([0.5, 0.3, 0.2], np.float32))), (8192, 3))
     tokens, logps = jax.jit(lambda x, key: _sample_token(x, key, temperature=1.0, top_k=0, top_p=0.6))(
         values, jax.random.PRNGKey(29)

@@ -12,7 +12,8 @@ from gemma4_posttrain_jax.sharding import tree_shardings
 
 
 def test_checkpoint_preserves_logical_order_and_scalar_shapes(tmp_path) -> None:
-    # TPU复制矩阵的host视图可能为列优先；checkpoint仍须保存逻辑行列与零维标量。
+    # Replicated TPU matrices may have column-major host views; checkpoints must preserve logical order and scalar
+    # shapes.
     state = {
         "matrix": np.asfortranarray(np.arange(12, dtype=np.float32).reshape(3, 4)),
         "floating_scalar": np.asarray(0.5, dtype=np.float32),

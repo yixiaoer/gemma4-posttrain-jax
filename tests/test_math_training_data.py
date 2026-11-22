@@ -1,4 +1,4 @@
-"""MATH训练不得泄漏重复/测试题，符号gold必须完整进入训练与评估。"""
+"""Exclude duplicate and test questions from MATH training while preserving symbolic answers through evaluation."""
 
 import pytest
 from test_data import FakeTokenizer

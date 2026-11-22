@@ -59,7 +59,6 @@ bash examples/e2b_sft_smoke.sh /path/to/e2b-snapshot /path/to/new-sft
 
 **它做了什么：** 脚本内置一道球数计算题（三排红球×4 + 两个蓝球 = 14），复制 4 份凑成 batch size 4（对应 4 块 TPU），序列长度统一到 128 token，然后在这同一批数据上连跑 4 步。
 
-**每一步的含义：**
 1. 前向传播，算出答案部分的 loss（模型预测与正确答案的差距）。
 2. 反向传播，得到各可训练参数的梯度。
 3. Adam 优化器根据梯度和历史状态更新参数。
@@ -120,7 +119,7 @@ new-grpo/
   recovery_check.json         比较结果（所有检查通过时 complete: true）
 ```
 
-运行中断的话，保留已有输出排查问题，再跑用新目录。
+如果运行中断，保留已有输出用于排查；重新运行整个示例时指定新的输出目录。
 
 ### 重新比较 / 手动续训
 
@@ -135,13 +134,30 @@ new-grpo/
 
 手动续训时，`--resume` 指向具体步骤目录（如 `step_00000002`），`--max-steps 4` 是全局步数上限（不是恢复后再跑 4 步）。恢复要求模型、数据、采样和训练配置一致，脚本会检查。
 
-**注意：** SFT 和 GRPO 示例各自从初始模型开始。把 SFT 结果接到 GRPO 需要手动处理权重和状态转换，示例没有自动完成这一步。
+SFT 和 GRPO 示例各自从初始模型开始。把 SFT 结果接到 GRPO 需要手动处理权重和状态转换，示例没有自动完成这一步。
 
----
+## 5. 选择生成布局并运行完整实验
 
-## 5. 完整的 GRPO 实验
+### 使用张量并行生成
 
-上面的恢复示例只训练 4 步，用来逐个比较数组。想看一次完整的训练，可以运行标准实验：在 GSM8K 上训练 200 步，第 100 步换新进程续训，最后单独加载训练结果评估，并自动检查续训是否与连续训练一致。
+全参数同步 GRPO 可以选择张量并行（TP）生成布局。下面的命令按当前策略采样回答，适合进行训练。
+
+```bash
+JAX_DEFAULT_MATMUL_PRECISION=highest .venv/bin/python scripts/train_grpo.py \
+  --model-path /path/to/e2b-snapshot --output-dir /path/to/new-tp-run \
+  --rollout-layout tp --tp-allreduce auto \
+  --prompt-batch-size 8 --group-size 4 --max-prompt-len 512 --max-new-tokens 1024 \
+  --microbatch-size 4 --max-steps 12 --updates-per-rollout 1 \
+  --learning-rate 1e-6 --beta 0 --remat --no-dynamic-sampling --no-filter-truncated-loss
+```
+
+恢复时继续指定 `--rollout-layout tp --tp-allreduce auto`，并保持其它训练配置一致；`auto` 会继承 checkpoint 中实际使用的归约方式。独立评估默认继承 checkpoint 的布局与归约方式。CPU 的 TP 数值检查使用 `--tp-allreduce xla`；融合 Pallas 路径需要 TPU。
+
+TP 生成使用与其他原生生成布局相同的 checkpoint 和评估机制。比较不同布局的性能时，应保持模型、输入、采样参数和计时范围一致。
+
+### 运行完整的 GSM8K 示例
+
+上面的恢复示例训练 4 步，便于保存并逐项比较所有状态。下面的完整实验在 GSM8K 上训练 200 步，第 100 步换新进程续训，最后单独加载训练结果评估，并自动检查续训是否与连续训练一致。
 
 ```bash
 WANDB_PROJECT=gemma4_posttrain_jax \
@@ -168,8 +184,6 @@ WANDB_PROJECT=gemma4_posttrain_jax \
 
 加上 `--audit-loaded-state`，评估前会把加载到的参数和 Adam 状态完整读一遍，为每个数组记下校验值，写入 `loaded_state_audit.json`，用来和训练结束时的记录对照，确认存档被完整读回。完整读一遍要花一些时间，所以默认不开。
 
----
-
 ## 7. 测试与验证范围
 
 安装 `.[hf,dev]` 后，可以在 CPU 上运行核心测试：
@@ -193,7 +207,7 @@ JAX_PLATFORMS=cpu .venv/bin/python -m pytest -m 'not tpu' \
   tests/test_stale_rollout.py tests/test_rollout_batch_audit.py
 ```
 
-本批迁移后的 ICI、BF16 内容与分块保存已在真实四芯 TPU v4 上通过 59 项数组检查。它们覆盖传输内容、浮点转换、分片方向、保存字节和失败条件，不加载 E2B。运行相同检查：
+ICI 权重同步、BF16 转换与分块保存已在四芯片 TPU v4 上通过 59 项数组检查，覆盖传输内容、浮点转换、分片方式、保存字节和失败条件。这些检查不加载 E2B，运行方法如下：
 
 ```bash
 JAX_PLATFORMS=tpu,cpu .venv/bin/python -m pytest \

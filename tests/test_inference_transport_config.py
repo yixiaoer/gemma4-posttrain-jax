@@ -1,4 +1,4 @@
-"""默认选择与进程边界，避免把尚未接通的独立运行时误标为 ICI。"""
+"""Check transport defaults and process boundaries so independent runtimes are not incorrectly labeled as ICI."""
 
 import sys
 from pathlib import Path

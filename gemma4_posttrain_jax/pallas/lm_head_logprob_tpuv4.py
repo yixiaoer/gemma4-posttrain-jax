@@ -1,4 +1,4 @@
-"""四芯片 TPU v4 训练 logprob：原生前向/dH 与 Pallas 归一化项 dW。"""
+"""Four-chip TPU v4 training logprobs with native forward/dH and Pallas normalization-term dW."""
 
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ from gemma4_posttrain_jax.sharding import DATA_AXIS
 
 
 def _dot(a: Array, b: Array) -> Array:
-    # 当前 Mosaic 将 BF16 的 HIGHEST 映射为不接受 BF16 操作数的指令。
-    # BF16 操作数使用原生 BF16 乘法、FP32 累加；FP32 操作数保留 HIGHEST。
+    # This Mosaic version lowers BF16 HIGHEST to an instruction that rejects BF16 operands.
+    # Use native BF16 products with FP32 accumulation for BF16 inputs, and retain HIGHEST for FP32 inputs.
     precision = lax.Precision.DEFAULT if a.dtype == jnp.bfloat16 else lax.Precision.HIGHEST
     return jnp.dot(a, b, precision=precision, preferred_element_type=jnp.float32)
 
@@ -50,7 +50,7 @@ def per_token_logps(
     vocab_chunk: int = 8192,
     sequence_chunk: int = 256,
 ) -> Array:
-    """保留原生浮点边界，按运行时上游梯度跳过全零块的一阶反向。"""
+    """Preserve native rounding boundaries and skip zero-gradient blocks in the first-order backward pass."""
     if mesh is None or mesh.size != 4 or DATA_AXIS not in mesh.axis_names:
         raise ValueError("Pallas logprob requires a four-chip vocabulary-parallel mesh")
     if any("TPU v4" not in device.device_kind for device in mesh.devices.flat):
@@ -104,11 +104,11 @@ def _weight_gradient_from_normalization(
     softcap: float | None,
     mesh: Any,
 ) -> Any:
-    """复用原生前向的归一化结果；只由 Pallas 计算权重梯度。"""
+    """Reuse native forward normalization results and compute only the weight gradient with Pallas."""
 
     def local(a: Any, b: Any, target: Any, values: Any, dy: Any) -> Any:
         offset = lax.axis_index(DATA_AXIS) * a.shape[0] if mesh is not None else 0
-        # 保留原 sequence scan 的 target gather/scatter 和 BF16 累加边界。
+        # Preserve the sequence scan's target gather/scatter and BF16 accumulation boundaries.
         rows, width = math.prod(target.shape), b.shape[-1]
         padding = math.ceil(rows / 256) * 256 - rows
         hidden_blocks = jnp.pad(b.reshape(rows, width), ((0, padding), (0, 0))).reshape(-1, 256, width)
@@ -162,7 +162,7 @@ def _shared_hidden_and_normalization(
     vocab_chunk: int,
     native_logps_and_normalization: Callable[..., tuple[Array, Array]],
 ) -> tuple[Any, Any, Any]:
-    """原生统计只作为辅助输出，反向仍按 256 行条件执行 hidden VJP。"""
+    """Expose native statistics as auxiliary outputs while retaining conditional hidden VJPs over 256-row blocks."""
     replicated = NamedSharding(mesh, P())
     h, targets = (lax.with_sharding_constraint(x, replicated) for x in (h, targets))
     rows, width = math.prod(targets.shape), h.shape[-1]
@@ -216,10 +216,10 @@ def _shared_hidden_and_normalization(
 def _normalization_weight_gradient(
     w: Array, h: Array, normalization: Array, g: Array, cap: float | None, positive: Array
 ) -> Array:
-    """按原生顺序舍入三分量 dW，最后写回时加上原生目标梯度。"""
+    """Round the three dW components in native order and add the native target gradient at the final write."""
     bm, bv = 256, 512
     m, v, d, _, vp, dp = _shape(w, h, bm, bv)
-    # 此 kernel 按词表块分给两个 TensorCore，token 只需补齐到一个计算块。
+    # Split vocabulary blocks across two TensorCores; pad tokens only to one computation block.
     mp = math.ceil(m / bm) * bm
 
     def token_block(_i: Any, j: Any) -> Any:
@@ -248,7 +248,8 @@ def _normalization_weight_gradient(
                 def initialize() -> None:
                     rounded[...] = jnp.zeros((bv, dp), w.dtype)
 
-                # 全零上游块不读写累加器；首块的 rounded 初始化仍无条件执行。
+                # Skip accumulator reads and writes for zero upstream blocks, but always perform rounded
+                # initialization.
                 @pl.when(jnp.any(gr[...] != 0))
                 def accumulate() -> None:
                     acc[...] = jnp.zeros((bv, dp), jnp.float32)
@@ -286,7 +287,7 @@ def _normalization_weight_gradient(
 
         pl.run_scoped(scan, pltpu.VMEM((bv, dp), jnp.float32), pltpu.VMEM((bv, dp), w.dtype))
 
-    # 复用通用输入布局，再去掉本 kernel 不需要的 token padding；目标项仍由原生 VJP 计算。
+    # Reuse the input layout without unnecessary token padding; the native VJP still computes the target term.
     hidden, weights, _ = _prepare(w, h, jnp.zeros(h.shape[:-1], jnp.int32), bm, bv)
     hidden = hidden[:mp]
     statistics = jnp.stack(

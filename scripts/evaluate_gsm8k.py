@@ -14,6 +14,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from train_grpo import compile_call, write_json
@@ -43,6 +44,7 @@ from gemma4_posttrain_jax.sharding import (
     shard_gemma4_text_params,
     tree_shardings,
 )
+from gemma4_posttrain_jax.tp_rollout import resolve_allreduce
 from gemma4_posttrain_jax.tracking import compile_tracking_metrics, grpo_tracking_metrics, init_tracker
 from gemma4_posttrain_jax.weights import load_hf_eos_token_ids, load_hf_params
 
@@ -82,7 +84,13 @@ def main() -> None:
         help="inherited from the checkpoint when omitted; chat for the initial HF model",
     )
     parser.add_argument(
-        "--rollout-layout", choices=("replicated", "fsdp"), help="inherited from the checkpoint when omitted"
+        "--rollout-layout", choices=("replicated", "fsdp", "tp"), help="inherited from the checkpoint when omitted"
+    )
+    parser.add_argument(
+        "--tp-allreduce",
+        choices=("auto", "xla", "one_shot_fused", "one_shot_fused_high_rows_local"),
+        default="auto",
+        help="TP reduction mode; auto inherits the checkpoint's resolved mode",
     )
     parser.add_argument("--subset", choices=("test-monitor", "train-dev", "test-unused", "math500"))
     parser.add_argument("--dev-size", type=int, default=500)
@@ -188,7 +196,35 @@ def main() -> None:
         master, step = state.params_f32, int(state.step)
         del state
     rollout_params: Any
-    if lora_config is None:
+    saved_config = None if checkpoint_meta is None else checkpoint_meta["run_config"]
+    args.tp_allreduce = resolve_allreduce(
+        args.tp_allreduce,
+        layout=args.rollout_layout,
+        tp=mesh.size,
+        rows=(args.batch_size,),
+        saved=saved_config,
+    )
+    tp_mesh = generate_options = None
+    if args.rollout_layout == "tp":
+        if lora_config is not None:
+            raise ValueError("TP evaluation currently requires a full-parameter checkpoint")
+        from gemma4_posttrain_jax.tp_rollout import (
+            attention_rows,
+            check_tp_config,
+            generate_compiler_options,
+            make_tp_mesh,
+            prepare_tp_params,
+        )
+
+        check_tp_config(config, mesh.size)
+        tp_mesh = make_tp_mesh(1, mesh.size, list(mesh.devices.flat))
+        rollout_params, _ = prepare_tp_params(
+            master,
+            tp_mesh,
+            attention_rows=attention_rows(args.tp_allreduce),
+        )
+        generate_options = generate_compiler_options(args.tp_allreduce)
+    elif lora_config is None:
         rollout_params = jax.jit(
             lambda current: reshard_for_rollout(current, config, mesh, layout=args.rollout_layout)
         )(master)
@@ -209,6 +245,13 @@ def main() -> None:
         del state
     jax.block_until_ready(rollout_params)
     del master
+
+    def shard_sample_inputs(ids, mask):
+        if tp_mesh is None:
+            return shard_batch((ids, mask), mesh)
+        placement = NamedSharding(tp_mesh, P())
+        return tuple(jax.device_put(np.asarray(value), placement) for value in (ids, mask))
+
     batches = prepare_eval_batches(
         dataset,
         tokenizer,
@@ -223,7 +266,14 @@ def main() -> None:
     eos_ids = load_hf_eos_token_ids(str(args.model_path), config)
     sampler_config = SamplerConfig(args.max_prompt_len, args.max_new_tokens, temperature=0, eos_ids=eos_ids)
     if lora_config is None:
-        sample = make_eval_sampler(config, sampler_config, mesh, rollout_layout=args.rollout_layout)
+        sample = make_eval_sampler(
+            config,
+            sampler_config,
+            mesh,
+            rollout_layout=args.rollout_layout,
+            param_tree=rollout_params,
+            tp_allreduce=args.tp_allreduce,
+        )
     else:
         sample = jax.jit(
             lambda current, ids, mask, key: generate(
@@ -238,9 +288,14 @@ def main() -> None:
             ),
             in_shardings=(tree_shardings(rollout_params),) + (NamedSharding(mesh, batch_spec(2)),) * 2 + (None,),
         )
-    first = shard_batch((batches[0].prompt_ids, batches[0].prompt_mask), mesh)
+    first = shard_sample_inputs(batches[0].prompt_ids, batches[0].prompt_mask)
     executable = compile_call(
-        "eval", sample, (rollout_params, *first, jax.random.PRNGKey(args.seed)), args.output_dir, False
+        "eval",
+        sample,
+        (rollout_params, *first, jax.random.PRNGKey(args.seed)),
+        args.output_dir,
+        False,
+        generate_options,
     )
     source_root = Path(__file__).resolve().parents[1]
     revision, diff = source_git_state(source_root)
@@ -281,7 +336,7 @@ def main() -> None:
             max_workers=args.reward_workers, mp_context=multiprocessing.get_context("spawn")
         ) as pool:
             summary = evaluate_batches(
-                lambda params, ids, mask, key: executable(params, *shard_batch((ids, mask), mesh), key),
+                lambda params, ids, mask, key: executable(params, *shard_sample_inputs(ids, mask), key),
                 rollout_params,
                 batches,
                 tokenizer,

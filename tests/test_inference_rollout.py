@@ -1,4 +1,4 @@
-"""独立引擎边界的随机流、状态身份、mask和概率负控制。"""
+"""Reject invalid RNG state, state identity, masks, and probabilities at the inference-engine boundary."""
 
 import sys
 from types import ModuleType, SimpleNamespace

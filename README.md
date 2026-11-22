@@ -13,9 +13,9 @@
 |---|---|
 | 文本模型与权重 | Gemma 4 文本模型的纯 JAX 实现和 Hugging Face 权重转换，包含逐层输入嵌入（PLE）、共享 KV、滑窗与全局 attention |
 | SFT 与强化学习 | 提供 SFT、GRPO、Dr. GRPO、DAPO、GSPO-token 和 RLOO 训练入口；支持可选 KL 正则、多次更新和 DAPO 动态补采，组合限制见[GRPO 及相关算法](docs/grpo-and-related-algorithms.md) |
-| 原生文本生成 | prefill 和 KV cache 解码，滑窗层使用环形缓存；支持 greedy、温度采样、top-k 和 top-p。RL 入口使用温度 1 的完整词表采样 |
+| 原生文本生成 | prefill 和 KV cache 解码，滑窗层使用环形缓存；通用采样器支持 greedy、温度采样、top-k 和 top-p。TP 生成支持 greedy 或完整词表采样，可用于训练、恢复和评估 |
 | 训练 logprob | 沿 token 和词表分块，在线累计 log-sum-exp，反向重计算；支持显式词表并行，无需保存完整的三维 logits。GRPO 只对回答对应的 hidden 计算 logprob |
-| 分片与内存管理 | 单主机 FSDP 风格的参数、梯度和优化器状态分片；FP32 主参数、BF16 计算；支持微批次、可选层重计算和 buffer donation。原生生成权重可复制或分片，重分片与计算所需的跨芯片通信使用 ICI |
+| 分片与内存管理 | 单主机 FSDP 风格的参数、梯度和优化器状态分片；FP32 主参数、BF16 计算；支持微批次、可选层重计算和 buffer donation。原生生成可选 replicated、FSDP 或 TP 布局；四芯片 TP 提供归约与归一化等融合算子 |
 | LoRA | 实现 attention Q/K/V/O 投影的适配器，接入原生 GRPO 训练、保存、恢复和独立评估 |
 | tpu-inference | 实验性生成后端，推荐同进程接入并通过 ICI 向推理芯片同步权重；双进程方案（经主机中转或共用分布式运行时）仅保留为开发对照，区别与配置见[整体设计](docs/design-overview.md) |
 | 保存与恢复 | 分块写出设备数组，保存参数、优化器状态及续训所需的随机配置和数据位置；按目标分片加载，提供连续训练与新进程续训的比较脚本 |
@@ -31,8 +31,11 @@
 - 主要验证环境是 E2B 和单机 TPU v4-8；E4B 有部分实验。
 - 12B LoRA 尚需在真实 TPU 上完成训练与恢复验证。
 - 使用原生 JAX 生成时，E2B 已在 GSM8K 上完整运行 200 步：第 100 步由新进程续训，结果与连续训练逐项一致，独立加载 checkpoint 的评估也与训练中相同；dev 准确率从 84.8% 升到 89.1%（单个种子），见[完整实验的结果](examples/e2b_grpo_gsm8k.md)。
-- tpu-inference 的 ICI 权重同步已通过 TPU 数组测试，但在 tpu-inference 路径下，完整的 E2B 训练、保存和新进程续训还没有验证。
+- tpu-inference 的 ICI 权重同步已通过 TPU 数组测试，并已用于短程同步训练测速；完整 E2B 保存、恢复和长期训练仍需分别验证。
+- 在 B8/N1024、B16/N2048 两组同步 GRPO 实验中，本项目与 Tunix 分别使用原生生成和同一个 tpu-inference 引擎，处理相同的回答。使用原生生成时，本项目吞吐为优化后 Tunix 基线的 **1.69–1.79 倍**；双方使用 tpu-inference 时为 **1.03–1.14 倍**。
 - 分块 logprob 和词表并行已用于训练；Pallas LM-head/logprob 需显式启用，长期 GRPO 数值差异尚未解决。Pallas attention 的局部结果仍需在完整模型中验证。
+
+同步测速使用 E2B-it 和同一组四个 TPU v4 芯片。B 是每批问题数，每题生成 4 个回答，N 是回答长度上限；通过固定回答序列保持两边工作量相同。每个框架和生成后端的组合各运行两个独立进程，每个进程取第 7–12 次迭代耗时的中位数计算吞吐比。计时包含权重准备、生成、评分和参数更新，不含初始编译、周期性保存与评估。这些结果反映特定配置下的执行效率，不代表自然采样时的学习质量更好。
 
 **已知限制**
 
@@ -65,7 +68,7 @@ JAX_PLATFORMS=cpu .venv/bin/python scripts/check_env.py --backend cpu
 
 ## 运行示例
 
-先准备好 E2B 的 Hugging Face 模型目录（方法见[快速开始](docs/quickstart.md)），下文记作 `/path/to/e2b-snapshot`。两个训练示例的第二个参数是输出目录。
+先按[快速开始](docs/quickstart.md)准备 E2B 的 Hugging Face 模型目录，下文用 `/path/to/e2b-snapshot` 表示。训练示例的第二个参数是新的输出目录。
 
 ### 生成回答
 
@@ -104,7 +107,7 @@ WANDB_PROJECT=gemma4_posttrain_jax \
 
 不设置 `WANDB_PROJECT` 就不连接 W&B。配置、检查内容和输出说明见[示例说明](examples/e2b_grpo_gsm8k.md)。
 
-各示例的目的、具体步骤和输出说明同样见[快速开始](docs/quickstart.md)。
+更多参数、保存与恢复命令见[快速开始](docs/quickstart.md)。
 
 ## 文档
 

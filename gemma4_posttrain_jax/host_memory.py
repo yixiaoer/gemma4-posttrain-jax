@@ -1,4 +1,4 @@
-"""Linux主机进程的RSS读取与glibc空闲页回收。"""
+"""Read Linux process RSS and return unused glibc pages to the operating system."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ def resident_memory_bytes() -> int:
 
 
 def trim_host_allocator() -> dict[str, Any]:
-    """请求glibc归还当前空闲页；保留返回值、调用前后RSS与耗时。"""
+    """Request glibc page reclamation and record its return value, elapsed time, and RSS before and after."""
     before = resident_memory_bytes()
     started = time.perf_counter()
     libc = ctypes.CDLL(None)

@@ -1,4 +1,4 @@
-"""LoRA独立HF梯度、零初始化、K=V/共享KV、循环cache与HF合并导出。"""
+"""Test LoRA against HF gradients, including zero initialization, shared KV, ring caches, and merged exports."""
 
 from __future__ import annotations
 
@@ -29,7 +29,8 @@ from gemma4_posttrain_jax.weights import convert_gemma4_text_params
 
 @pytest.fixture(params=[TINY_A, TINY_B], ids=["ple-shared-kv", "12b-k-equals-v"])
 def lora_fixture(request):
-    # 复用已有HF小模型fixture构造器；小权重便于严格反向比较，不初始化基础模型。
+    # Reuse the HF tiny-model fixture with small weights for strict backward comparisons, without loading base
+    # weights.
     model = build_hf_model(request.param, seed=7, weight_std=0.03, norm_std=0.05, layer_scalar_min=0.95)
     config = config_from_hf(request.param)
     base = convert_gemma4_text_params(model.state_dict().__getitem__, config)
@@ -122,7 +123,8 @@ def test_all_adapter_gradients_match_independent_torch_hf(lora_fixture):
                 expected_leaves.extend((a, b))
                 weight = getattr(base_layer.attention, name)
                 delta = (a @ b * (settings.alpha / settings.rank)).reshape(weight.shape)
-                # 显式HF轴转换独立于JAX导出函数；q/o的H/R顺序不可互换。
+                # Convert HF axes independently of the JAX exporter; q/o head and repetition axes are not
+                # interchangeable.
                 if name == "q_proj":
                     delta = delta.permute(0, 2, 1, 3).reshape(weight.shape[0], -1).T
                 elif name == "o_proj":
@@ -183,7 +185,7 @@ def test_all_adapter_gradients_match_independent_torch_hf(lora_fixture):
 
 
 def test_bf16_keeps_low_rank_signal_lost_by_weight_merge():
-    # 正负基础权重抵消；逐权重0.001会被BF16吞掉，独立分支的总增量仍可表示。
+    # Base weights cancel; BF16 loses individual 0.001 updates, but the separate branch retains their combined effect.
     x = jnp.ones((1, 1, 32), dtype=jnp.bfloat16)
     weight = jnp.tile(jnp.asarray([1, -1], dtype=jnp.bfloat16), 16)[:, None].repeat(4, axis=1)
     params = LowRankParams(jnp.ones((32, 1), dtype=jnp.float32), jnp.full((1, 4), 0.001, dtype=jnp.float32))

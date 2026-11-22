@@ -1,6 +1,7 @@
-"""可选 tpu-inference 研究后端：同步生成、真实参数更新与版本化生命周期。
+"""Optional tpu-inference backend for synchronous generation and versioned weight updates.
 
-模块导入只依赖标准库；构造引擎才导入 JAX、Flax 与 vLLM。仅支持单进程指定芯片。
+Module imports use only the standard library. Engine construction imports JAX, Flax, and vLLM and uses the
+selected chips in one process.
 """
 
 from __future__ import annotations
@@ -92,7 +93,7 @@ EXPECTED_SOURCE_SHA256 = {
 
 
 def resolve_weight_sync_transport(backend: str, transport: str = "auto") -> str:
-    """同进程默认用 ICI；独立运行时保留主机协议，不静默回退。"""
+    """Default to ICI in a shared process and host transfer across independent runtimes, without silent fallback."""
     if backend not in ("jax", "inference", "inference-process", "inference-distributed") or transport not in (
         "auto",
         "host",
@@ -185,7 +186,7 @@ def file_sha256(path: Path) -> str:
 def selected_proposal_logprob(
     selected: int, entries: dict[int, Any], sampling: EngineSampling
 ) -> tuple[float | None, str]:
-    """有界 top-k 在 host FP64 重建分布；其误差口径不等同于 device sampler 的逐位概率。"""
+    """Reconstruct bounded top-k distributions in host FP64; these are not bit-exact device sampler probabilities."""
     validate_sampling(sampling)
     raw = float(entries[selected].logprob)
     if not math.isfinite(raw):
@@ -219,7 +220,7 @@ def selected_proposal_logprob(
 
 
 def shutdown_owned_scheduler(scheduler: Any, timeout_s: float = 5.0) -> dict[str, Any]:
-    """只关闭本 scheduler；对上游无界 ack 使用限时等待与本对象进程/pipe 后备清理。"""
+    """Close this scheduler with bounded acknowledgement waits and cleanup of its own processes and pipes."""
     report: dict[str, Any] = {"shutdown_returned": False, "errors": []}
 
     def shutdown() -> None:
@@ -269,7 +270,7 @@ def shutdown_owned_scheduler(scheduler: Any, timeout_s: float = 5.0) -> dict[str
 
 
 class EngineRuntime:
-    """显式串行生命周期；同进程只应存在一个本类引擎，不能与另一 vLLM 引擎交错更新。"""
+    """Manage a serial engine lifecycle; do not interleave weight updates with another vLLM engine in this process."""
 
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
@@ -656,7 +657,9 @@ class EngineRuntime:
         return recovery
 
     def sync_params(self, params: Any, model_config: Any, version: int) -> dict[str, Any]:
-        """与独立进程后端共享完整参数接口，沿用原事务与映射实现。"""
+        """Expose the same full-parameter interface as the separate-process backend, reusing mapping and
+        transactions.
+        """
         from .inference_weights import apply_gemma4_params
 
         return self.update_weights(
@@ -725,7 +728,8 @@ class EngineRuntime:
 
         context = jax.default_matmul_precision("default") if jax is not None else nullcontext()
         with context:
-            # 错误 traceback、NNX 对象或已编译闭包可能继续引用数组；显式 delete 解除设备内存所有权。
+            # Tracebacks, NNX objects, or compiled closures may retain arrays; explicit delete releases device
+            # storage.
             attempt("collect_arrays_before_recovery", collect_model_arrays)
             if getattr(self, "_pending", None) is not None:
                 attempt("recovery", self.abort_update)
@@ -736,7 +740,8 @@ class EngineRuntime:
             manager = getattr(core, "structured_output_manager", None)
             if manager is not None:
                 attempt("structured_output_backend_cleared", manager.clear_backend)
-                # 这些线程池均为本 manager 成员；跳过 Core.shutdown 的全局清理时仍显式处理。
+                # These thread pools belong to this manager; close them even when skipping Core.shutdown's global
+                # cleanup.
                 for name in ("executor", "executor_for_fillmask"):
                     pool = getattr(manager, name, None)
                     if pool is not None and callable(getattr(pool, "shutdown", None)):
@@ -754,7 +759,7 @@ class EngineRuntime:
             finalizer = getattr(llm_engine, "_finalizer", None)
             if finalizer is not None:
                 detached = attempt("model_finalizer_detached", finalizer.detach)
-                # 不把 detach 返回的 model/args 放到可序列化报告里；否则会再次保活模型。
+                # Do not store detach's model or arguments in the report, which would keep the model alive again.
                 report["model_finalizer_detached"] = detached is not None
                 if detached is not None:
                     _, function, args, kwargs = detached
@@ -769,7 +774,7 @@ class EngineRuntime:
 
                 def destroy_own_group() -> None:
                     stateless_destroy_torch_distributed_process_group(group)
-                    cast(Any, llm_engine).dp_group = None  # 防止 LLMEngine.__del__ 重复销毁本 group。
+                    cast(Any, llm_engine).dp_group = None  # Prevent LLMEngine.__del__ from destroying this group twice.
 
                 attempt("owned_dp_group_destroyed", destroy_own_group)
             deleted = 0
@@ -791,7 +796,7 @@ class EngineRuntime:
             report["owned_model_arrays_deleted"] = deleted
             report["foreign_device_arrays_not_deleted"] = skipped
             if scheduler is not None and type(scheduler).__module__ == "tpu_inference.core.sched.dp_scheduler":
-                # 原 shutdown 在失败时可能没走到末尾；只恢复本 scheduler 安装的 pickle 函数。
+                # Shutdown may have failed early; restore only the pickle functions installed by this scheduler.
                 import atexit
 
                 dp_module = importlib.import_module("tpu_inference.core.sched.dp_scheduler")

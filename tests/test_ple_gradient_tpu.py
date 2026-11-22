@@ -1,4 +1,4 @@
-"""覆盖三维PLE查表反向与微批scan的交互，防止累计梯度在分片上丢失。"""
+"""Test 3D PLE lookup gradients inside microbatch scans to catch lost gradient accumulation across shards."""
 
 import math
 

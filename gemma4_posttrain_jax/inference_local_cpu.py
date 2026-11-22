@@ -1,4 +1,4 @@
-"""固定 tpu-inference 加载器的进程内适配：非零 rank 使用本地 CPU。"""
+"""Adapt the pinned tpu-inference loader so nonzero ranks use their local CPU device."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ LOADERS = (
 
 
 class LocalCpuLoaders:
-    """退出或安装中途失败时恢复原函数及缓存；不修改安装目录。"""
+    """Restore original functions and caches on exit or partial installation failure; do not edit installed files."""
 
     def __init__(self) -> None:
         self.originals: list[tuple[Any, str, Any]] = []

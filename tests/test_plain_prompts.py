@@ -1,4 +1,4 @@
-"""plain指令的真实token边界与训练/评估模板身份。"""
+"""Check actual token boundaries and training/evaluation template identity for plain prompts."""
 
 from __future__ import annotations
 

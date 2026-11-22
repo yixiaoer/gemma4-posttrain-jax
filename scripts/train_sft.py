@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""在TPU v4上进行Gemma 4 FSDP SFT，支持梯度累积与完整状态恢复。"""
+"""Train Gemma 4 with FSDP SFT on TPU v4, supporting gradient accumulation and full-state recovery."""
 
 from __future__ import annotations
 
@@ -143,7 +143,9 @@ def jit_cache_size(jitted: Any) -> int | None:
 
 
 def git_commit() -> str | None:
-    """按脚本源码目录记录提交；独立快照不继承运行目录或父仓库身份。"""
+    """Identify the commit from the script's source root, never from an unrelated working directory or parent
+    repository.
+    """
 
     return source_git_state(Path(__file__).resolve().parents[1])[0]
 
@@ -157,7 +159,7 @@ def estimated_mfu(*, tokens: int, elapsed_s: float) -> float:
 def validate_resume_config(saved: Mapping[str, Any], current: Mapping[str, Any]) -> None:
     """Refuse a continuation whose model, optimizer, data shape, or JIT controls changed."""
 
-    # 未记录后端的旧 checkpoint 使用原生 JAX。
+    # Legacy checkpoints without a backend field use native JAX.
     saved = {"logprob_backend": "jax", **saved}
     current = {"logprob_backend": "jax", **current}
     fields = RESUME_CONFIG_FIELDS + (("seed",) if current.get("mode") == "gsm8k" else ())

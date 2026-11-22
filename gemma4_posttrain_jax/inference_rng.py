@@ -1,4 +1,4 @@
-"""固定调度批次的typed PRNG状态；不承诺逐请求独立随机流。"""
+"""Preserve typed PRNG state for fixed scheduler batches, without promising independent streams per request."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ class BatchRngState:
 
 
 def read_runner_rng(runner: Any, expected_device_ids: tuple[int, ...]) -> tuple[BatchRngState, dict[str, Any]]:
-    """读取实际采样key和放置；调用方必须先确认引擎无活动请求。"""
+    """Read the actual sampling key and placement after the caller confirms that the engine is idle."""
     import jax
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec
@@ -72,7 +72,7 @@ def read_runner_rng(runner: Any, expected_device_ids: tuple[int, ...]) -> tuple[
 
 
 def install_runner_rng(runner: Any, state: BatchRngState, expected_device_ids: tuple[int, ...]) -> dict[str, Any]:
-    """保留原有NamedSharding，运输完成且实际读回匹配后才返回。"""
+    """Preserve NamedSharding and return only after transfer completion and a matching device readback."""
     import jax
     import numpy as np
 

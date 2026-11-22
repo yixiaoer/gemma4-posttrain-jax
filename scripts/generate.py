@@ -1,7 +1,7 @@
-"""使用纯JAX生成回答，支持greedy、temperature、TopK和Top-p采样。
+"""Generate with native JAX using greedy decoding, temperature, top-k, or top-p.
 
-可重复传入--prompt，在一个设备上batch生成。--compare-hf会同时用Hugging Face
-Transformers在CPU上以FP32加载同一模型，并按相同采样设置生成回答供比较。
+Repeat --prompt to generate a batch on one device. --compare-hf also loads the same model with Hugging Face
+Transformers on CPU in FP32 and generates with matching sampling settings.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def resolve_snapshot(path: str | None) -> str:
 
 
 def encode_prompts(tokenizer: Any, prompts: Sequence[str], *, chat: bool) -> tuple[Any, Any]:
-    """将不同长度的输入左填充到同一宽度，显式记录有效token。"""
+    """Left-pad variable-length inputs to a common width and explicitly mark valid tokens."""
     import numpy as np
 
     if tokenizer.pad_token_id is None:
@@ -90,7 +90,7 @@ def encode_prompts(tokenizer: Any, prompts: Sequence[str], *, chat: bool) -> tup
 
 
 def hf_generation_config(args: argparse.Namespace, eos_ids: tuple[int, ...], pad_token_id: int) -> Any:
-    """显式构造生成设置，避免模型默认的TopK或Top-p改变对照的采样分布。"""
+    """Set generation options explicitly so model defaults cannot silently change top-k or top-p sampling."""
     from transformers import GenerationConfig
 
     sampling = args.temperature > 0

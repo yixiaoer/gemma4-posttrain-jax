@@ -1,4 +1,4 @@
-"""联合old捕获的梯度、独立冻结重放、TIS与动态标志编译边界。"""
+"""Test joint old-policy capture gradients, independent fixed-policy replay, TIS, and dynamic-flag compilation."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def check_joint_old_replay(grad_tiny, algorithm, cap, *, mesh=None) -> None:
                 mesh=mesh,
             )
         )(params)
-        # 选择明确跨过cap的两类采样概率；后面用NumPy检查实际捕获old与behavior的比值。
+        # Choose behavior probabilities on both sides of the cap, then check captured old/behavior ratios with NumPy.
         behavior = standalone - jnp.log(jnp.tile(jnp.asarray([0.5, 3.0]), ids.shape[0] // 2))[:, None]
     optimizer, trainable = make_optimizer(params, learning_rate=1e-3)
     state = init_train_state(params, optimizer)
@@ -127,7 +127,7 @@ def check_joint_old_replay(grad_tiny, algorithm, cap, *, mesh=None) -> None:
 
     weights = None
     if cap is not None:
-        # 独立NumPy公式；不是再调用TIS函数作为oracle。
+        # Use an independent NumPy formula rather than calling TIS again as its own reference.
         expected_weights = np.where(np.asarray(mask), np.minimum(np.exp(anchor_host - np.asarray(behavior)), cap), 0)
         assert np.any(expected_weights[np.asarray(mask)] == cap)
         assert np.any((expected_weights > 0) & (expected_weights < cap))

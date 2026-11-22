@@ -138,7 +138,7 @@ def tpu_tiny():
 
 @pytest.fixture(scope="session")
 def tpu_grad_tiny():
-    """沿用梯度 oracle 的温和权重尺度，词表改为四芯片可整除。"""
+    """Keep the gradient reference's small weight scale and make vocabulary size divisible by four chips."""
 
     kwargs = {**TINY_A, "vocab_size": 96, "vocab_size_per_layer_input": 96}
     model = build_hf_model(kwargs, seed=7, weight_std=0.03, norm_std=0.05, layer_scalar_min=0.8)

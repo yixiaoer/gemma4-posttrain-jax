@@ -1,4 +1,4 @@
-"""将独立推理引擎适配到训练 Rollout 协议，显式保存版本和批次随机状态。"""
+"""Adapt an inference engine to the training rollout interface, retaining policy versions and batch RNG state."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 
 class InferenceBackend(Protocol):
-    """两种部署共享的参数提交与生成边界；实现负责实际运输与资源所有权。"""
+    """Share weight-commit and generation interfaces across deployments; implementations own transport and resources."""
 
     def sync_params(self, params: Gemma4TextParams, model_config: Gemma4TextConfig, version: int) -> dict[str, Any]: ...
 
@@ -38,7 +38,7 @@ class InferenceBackend(Protocol):
 
 
 def token_prompts(prompt_ids: Any, prompt_mask: Any) -> list[list[int]]:
-    """只接受本训练入口的左填充；拒绝内部空洞和全padding请求。"""
+    """Accept left-padded training prompts, rejecting internal gaps and requests containing only padding."""
     ids, mask = np.asarray(prompt_ids), np.asarray(prompt_mask)
     if ids.ndim != 2 or mask.shape != ids.shape or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("prompt ids 必须为二维整数，mask 形状必须完全一致")
@@ -53,7 +53,7 @@ def token_prompts(prompt_ids: Any, prompt_mask: Any) -> list[list[int]]:
 
 
 class InferenceRollout:
-    """参数运输由独立映射器负责，生成结果放回指定训练mesh。"""
+    """Delegate weight transfer to the mapper and place generated results on the requested training mesh."""
 
     def __init__(
         self,

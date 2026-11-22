@@ -1,4 +1,4 @@
-"""检查 GRPO 后端配置穿过 microbatch、联合 old 捕获和实际更新。"""
+"""Check GRPO backend selection through microbatching, joint old-policy capture, and actual updates."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def install_recorded_head(monkeypatch):
 
     def recorded(*args, backend="jax", **kwargs):
         seen.append(backend)
-        # CPU 只核对路由；算术仍由原生实现执行，不能授予 Pallas 数值资格。
+        # CPU checks routing with native arithmetic; it does not validate Pallas numerics.
         return original(*args, backend="jax", **kwargs)
 
     monkeypatch.setattr(losses, "per_token_logps", recorded)

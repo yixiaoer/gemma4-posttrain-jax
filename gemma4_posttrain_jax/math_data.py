@@ -1,4 +1,4 @@
-"""固定MATH原始划分、显式去重/去重叠与保持数学符号的gold规范化。"""
+"""Use fixed MATH splits, remove duplicates and overlap explicitly, and preserve symbols in normalized answers."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ SUBJECTS = (
 
 
 def last_boxed_answer(solution: str) -> str:
-    """取最后一个boxed/fbox的平衡内容；转义的集合花括号不改变嵌套深度。"""
+    """Extract the last balanced boxed/fbox expression; escaped set braces do not change nesting depth."""
     starts = list(re.finditer(r"\\(?:boxed|fbox)\b\s*", solution))
     if not starts:
         raise ValueError("solution没有boxed/fbox答案")
@@ -34,7 +34,7 @@ def last_boxed_answer(solution: str) -> str:
     if start >= len(solution):
         raise ValueError("boxed命令后没有答案")
     if solution[start] != "{":
-        # 固定MATH来源有两条合法的单数字TeX参数；不把无括号多token表达式猜作完整答案。
+        # The fixed dataset has two valid single-digit TeX arguments; do not infer unbraced multi-token answers.
         if solution[start] in "0123456789" and (start + 1 == len(solution) or solution[start + 1] in " $.,;)]}"):
             return solution[start]
         raise ValueError("不支持无花括号的多token答案")
@@ -66,7 +66,7 @@ class MathData(NamedTuple):
 def prepare_math_training_rows(
     training: Sequence[Mapping[str, Any]], test: Sequence[Mapping[str, Any]]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """排除空gold、所有重复题行和与原test相同的题；每个排除理由均返回供存档。"""
+    """Exclude empty answers, all duplicate rows, and test overlap; return a reason for every exclusion."""
     counts = Counter(question_key(str(row["problem"])) for row in training)
     test_keys = {question_key(str(row["problem"])) for row in test}
     included, excluded = [], []
@@ -124,7 +124,9 @@ def _load_original_rows(split: str) -> tuple[list[dict[str, Any]], dict[str, str
 
 
 def load_math_training_data() -> MathData:
-    """仅使用原始train7500；test问题只用于完全相同题排除，不使用其答案生成训练标签。"""
+    """Use only the original 7,500 training rows; test questions identify exact overlap and never supply training
+    answers.
+    """
     from datasets import Dataset
 
     training, train_fingerprints = _load_original_rows("train")
@@ -156,7 +158,7 @@ def load_math_training_data() -> MathData:
 
 
 def load_math500_data() -> MathData:
-    """保留500条原始题号及带boxed的符号gold；加载本身不执行模型评估。"""
+    """Keep the original indices and boxed symbolic answers for 500 questions; loading does not evaluate a model."""
     from datasets import Dataset, load_dataset
 
     source = load_dataset("HuggingFaceH4/MATH-500", split="test", revision=MATH500_REVISION)

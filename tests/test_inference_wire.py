@@ -1,4 +1,4 @@
-"""跨进程控制帧与完整参数结构：字节/shape/路径错误必须在运输前被拒绝。"""
+"""Reject invalid byte counts, shapes, and parameter paths before transport between processes."""
 
 from __future__ import annotations
 

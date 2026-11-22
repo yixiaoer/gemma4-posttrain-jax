@@ -135,7 +135,7 @@ def param_specs_replicated(config: Gemma4TextConfig) -> Any:
 
 
 def param_specs_rollout(config: Gemma4TextConfig, *, layout: str = "replicated", num_devices: int = 4) -> Any:
-    """训练、周期评估与独立评估共用的采样权重布局。"""
+    """Define a shared sampling-weight layout for training, periodic evaluation, and independent evaluation."""
     if layout == "replicated":
         return param_specs_replicated(config)
     if layout == "fsdp":
@@ -218,10 +218,11 @@ def reshard_for_rollout(
     dtype: Any = jnp.bfloat16,
     layout: str = "replicated",
 ) -> Gemma4TextParams:
-    """转换采样所用的类型，并保持每个参数数组指定的复制或 FSDP 布局。
+    """Cast sampling weights while preserving the requested replicated or FSDP layout for each parameter.
 
-    这是可放入长生命周期jit的纯函数；不覆盖原FP32 master，也不创建内部jit。
-    调用方须使用相同布局的out_shardings，分别记录编译、转换和稳态时间。
+    This pure function can live inside a reusable JIT. It neither overwrites the FP32 master nor creates an
+    internal JIT. The caller must use matching out_shardings and measure compilation, conversion, and steady
+    execution separately.
     """
 
     shardings = named_shardings(param_specs_rollout(config, layout=layout, num_devices=mesh.size), mesh)

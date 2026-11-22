@@ -1,4 +1,4 @@
-"""固定评估子集、末批补齐、EOS 与统计分母的 CPU 回归。"""
+"""Test fixed evaluation subsets, final-batch padding, EOS handling, and metric denominators on CPU."""
 
 from __future__ import annotations
 

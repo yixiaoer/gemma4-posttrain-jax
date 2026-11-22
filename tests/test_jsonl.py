@@ -1,4 +1,4 @@
-"""真实plain输出中的U+2028不能被拆成额外JSON记录。"""
+"""Preserve U+2028 inside plain-text output instead of splitting it into extra JSON records."""
 
 import json
 from pathlib import Path

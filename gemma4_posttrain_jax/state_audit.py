@@ -1,4 +1,4 @@
-"""记录各个状态数组的校验值，用于比较连续训练和恢复后的结果。"""
+"""Record per-array state checksums to compare uninterrupted and resumed training."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any, cast
 
 
 def summarize_train_state(state: Any) -> dict[str, Any]:
-    """分块计算全部数组的内容摘要，避免大参数读回和源状态缓存累积。"""
+    """Hash all state arrays in chunks, avoiding full large-parameter readbacks and retained source caches."""
     import jax
     import numpy as np
 
@@ -63,7 +63,7 @@ def summarize_train_state(state: Any) -> dict[str, Any]:
 def snapshot_parameter_witness(
     params: Any, trainable: Any, *, max_elements: int = 8192, max_leaves: int = 8
 ) -> dict[str, Any]:
-    """复制少量可训练参数到主机，用于比较更新前后的数值变化。"""
+    """Copy a few small trainable parameters to the host to inspect changes after an update."""
     import jax
     import numpy as np
 
@@ -80,7 +80,7 @@ def snapshot_parameter_witness(
     for (path, leaf), active in zip(paths, enabled, strict=True):
         if not active or not 0 < leaf.size <= max_elements or not np.issubdtype(leaf.dtype, np.floating):
             continue
-        # 独立host副本不保留即将donate的设备buffer。
+        # Use independent host copies so device buffers can be donated without retained references.
         result[jax.tree_util.keystr(path)] = np.array(jax.device_get(leaf), copy=True, order="C")
         if len(result) == max_leaves:
             break
@@ -90,7 +90,7 @@ def snapshot_parameter_witness(
 
 
 def compare_parameter_witness(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
-    """比较对应数组中的各个元素，记录数值变化和非有限值。"""
+    """Compare corresponding array elements and record numeric changes and nonfinite values."""
     import numpy as np
 
     if not before or before.keys() != after.keys():

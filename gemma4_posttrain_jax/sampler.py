@@ -28,11 +28,11 @@ from gemma4_posttrain_jax.sharding import constrain_batch, constrain_batch_tree
 
 
 class SamplerConfig(NamedTuple):
-    """生成时固定的采样配置。
+    """Hold sampling settings fixed during generation.
 
-    temperature<=0使用greedy，top_k<=0关闭TopK截断，top_p=1关闭Top-p截断。
-    随机采样先应用temperature，再做TopK和Top-p。记录的logprob始终来自
-    未调整温度、未截断的FP32策略分布，不能用它代替实际采样分布的概率。
+    Use greedy decoding when temperature<=0, disable top-k when top_k<=0, and disable top-p when top_p=1.
+    Stochastic sampling applies temperature, then top-k and top-p. Recorded logprobs always come from the
+    unscaled, untruncated FP32 model distribution, not the modified sampling distribution.
     """
 
     max_prompt_len: int
@@ -149,8 +149,8 @@ def _sample_token(
 
     with jax.named_scope("rollout_policy"):
         logits32 = logits.astype(jnp.float32)
-        # TPU默认exp/log近似曾使小词表logprob偏差达到3.65e-5。
-        # matmul精度设置不会控制这些算子，这里显式要求高精度。
+        # Default TPU exp/log approximations produced small-vocabulary logprob errors of up to 3.65e-5.
+        # Matmul precision does not control these operations, so request high accuracy explicitly.
         shifted = logits32 - jnp.max(logits32, axis=-1, keepdims=True)
         normalizer = lax.log(
             jnp.sum(lax.exp(shifted, accuracy=lax.AccuracyMode.HIGHEST), axis=-1, keepdims=True),
@@ -174,7 +174,8 @@ def _sample_token(
                 previous_mass = jnp.concatenate(
                     (jnp.zeros_like(probabilities[:, :1]), jnp.cumsum(probabilities, axis=-1)[:, :-1]), axis=-1
                 )
-                # 保留使累计概率达到p的那一项，并保证至少保留概率最高的token。
+                # Keep the token that reaches cumulative probability p, retaining at least the highest-probability
+                # token.
                 keep = (previous_mass < top_p) | (jnp.arange(scores.shape[-1])[None, :] == 0)
                 scores = jnp.where(keep, scores, -jnp.inf)
             selected = jax.random.categorical(key, scores, axis=-1).astype(jnp.int32)

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, cast
 
 import einops as op
 import jax
@@ -59,7 +59,7 @@ class Gemma4TextConfig(NamedTuple):
 
 
 def _hf_attention_dimensions(text: Mapping[str, Any], layer_types: list[str]) -> tuple[int, int, int, int | None]:
-    """把HF稀疏逐层配置还原为本模型支持的两类attention维度；拒绝不能表示的异构覆盖。"""
+    """Map sparse HF layer settings to the two supported attention shapes, rejecting unrepresentable overrides."""
 
     head_dim = int(text.get("head_dim", 256))
     kv_heads = int(text["num_key_value_heads"])
@@ -365,6 +365,51 @@ def make_cached_qk_masks(
     return {FULL: full[:, None, None], SLIDING: sliding[:, None, None]}
 
 
+def make_chunked_qk_masks(
+    old_mask: Array, new_mask: Array, sliding_window: int, *, query_start: Array
+) -> dict[str, Array]:
+    """Append a chunk using old ring-cache KV plus current KV, preserving history needed by the chunk's early
+    queries.
+    """
+
+    if query_start.ndim == 1:
+        return cast(
+            dict[str, Array],
+            jax.vmap(
+                lambda old, new, start: jax.tree.map(
+                    lambda value: value[0],
+                    make_chunked_qk_masks(old[None], new[None], sliding_window, query_start=start),
+                )
+            )(old_mask, new_mask, query_start),
+        )
+    capacity = old_mask.shape[1]
+    window = min(sliding_window, capacity)
+    queries = new_mask.shape[1]
+    query_positions = query_start + jnp.arange(queries, dtype=jnp.int32)
+    key_mask = update_cache_mask(old_mask, new_mask, query_start)
+    full = (jnp.arange(capacity)[None, :] <= query_positions[:, None])[None] & key_mask[:, None, :]
+    slots = jnp.arange(window, dtype=jnp.int32)
+    old_positions = slots + jnp.floor_divide(query_start - 1 - slots, window) * window
+    old_real = jnp.take(old_mask, jnp.clip(old_positions, 0, capacity - 1), axis=1) & (old_positions >= 0)[None]
+    positions = jnp.concatenate((old_positions, query_positions))
+    real = jnp.concatenate((old_real, new_mask), axis=1)
+    sliding = (positions[None, :] <= query_positions[:, None]) & (
+        positions[None, :] > query_positions[:, None] - sliding_window
+    )
+    sliding = sliding[None] & real[:, None, :]
+    return {FULL: full[:, None, None], SLIDING: sliding[:, None, None]}
+
+
+def update_cache_mask(key_mask: Array, attention_mask: Array, start: Array) -> Array:
+    """Write masks within fixed capacity, keeping each request's position independent of other rows."""
+
+    if start.ndim == 1:
+        return jax.vmap(lambda old, new, pos: lax.dynamic_update_slice(old, new, (pos,)))(
+            key_mask, attention_mask, start
+        )
+    return lax.dynamic_update_slice(key_mask, attention_mask, (0, start))
+
+
 def _update_layer_cache(cache: LayerKVCache, key: Array, value: Array, *, start: Array, circular: bool) -> LayerKVCache:
     """Write a prefill chunk or one decode token into a static layer cache."""
 
@@ -398,7 +443,7 @@ def forward_mlp(params: MLPParams, x: Array) -> Array:
 
 @jax.custom_jvp
 def _lookup_per_layer_tokens(table: Array, input_ids: Array) -> Array:
-    """保持三维前向与切线查表，以局部屏障隔离错误scatter外移。"""
+    """Keep three-dimensional forward and tangent lookups, using a local barrier to prevent incorrect scatter motion."""
     return jnp.take(table, input_ids, axis=0)
 
 
@@ -406,7 +451,7 @@ def _lookup_per_layer_tokens(table: Array, input_ids: Array) -> Array:
 def _lookup_per_layer_tokens_jvp(primals: tuple[Array, Array], tangents: tuple[Array, Array]) -> tuple[Array, Array]:
     table, input_ids = primals
     table_tangent, _ = tangents
-    # 转置后的屏障隔离scatter与微批carry，保持原来的三维查表布局。
+    # The transposed barrier separates scatter from the microbatch carry while preserving the 3D lookup layout.
     tangent = jnp.take(jax.lax.optimization_barrier(table_tangent), input_ids, axis=0, fill_value=0)
     return _lookup_per_layer_tokens(table, input_ids), tangent
 

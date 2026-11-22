@@ -1,4 +1,4 @@
-"""PLE切线规则保持原查表的前向、负索引/越界和高阶可微接口。"""
+"""Preserve PLE lookup values, negative and out-of-range indices, and higher-order differentiation."""
 
 import jax
 import jax.numpy as jnp

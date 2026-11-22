@@ -1,7 +1,7 @@
-"""TPU v4 单 chip Splash 存储实验：BF16 搬运 Q/K/V，片上恢复 FP32 运算接口。
+"""Single-chip TPU v4 Splash storage experiments using BF16 Q/K/V transfers and an FP32 compute interface.
 
-只在独立模块中改写已核验的安装源码；不修改 JAX 模块或 wheel。
-保存的输出与返回的 cotangent 保持 FP32。实际精度和收益须单独验证。
+Adapt verified installed source in a separate module without changing JAX or its wheel. Saved outputs and
+returned cotangents remain FP32. Measure numerical accuracy and performance separately.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ VARIANT = "bf16-storage-fp32-compute-v1"
 
 
 def _split_dq_compute(source: str, compute: int, *, unroll: bool) -> str:
-    """保持搬运窗口，在dQ kernel内部串行计算更小的KV子块。"""
+    """Keep transfer windows intact while computing smaller KV subblocks serially inside the dQ kernel."""
     if compute < 128 or compute % 128:
         raise ValueError("dQ计算块必须是128的正倍数")
     start = source.index("def _flash_attention_dq_kernel(")
@@ -73,7 +73,7 @@ def _split_dq_compute(source: str, compute: int, *, unroll: bool) -> str:
 
 
 def _dkv_scratch(source: str, *, vmem: bool, output_buffers: int | None) -> str:
-    """dK/dV累加量跨Q块和Q heads保留，只改变分配及输出缓冲。"""
+    """Retain dK/dV accumulators across query blocks and heads, changing only allocation and output buffers."""
     if output_buffers is not None and output_buffers not in (1, 2):
         raise ValueError("dKV输出缓冲数量必须是1或2")
     start = source.index("def _flash_attention_dkv_kernel(")
@@ -87,7 +87,8 @@ def _dkv_scratch(source: str, *, vmem: bool, output_buffers: int | None) -> str:
                     "    # Outputs\n    dq_scratch_ref,\n    dk_scratch_ref,\n    dv_scratch_ref,\n"
                     "    dq_ref,\n    dk_ref,\n    dv_ref,",
                     "    # Outputs\n    dq_scratch_ref,\n    dq_ref,\n    dk_ref,\n    dv_ref,\n"
-                    "    # VMEM临时量：跨Q块和Q heads保留。\n    dk_scratch_ref,\n    dv_scratch_ref,",
+                    "    # Keep VMEM scratch across query blocks and query heads.\n"
+                    "    dk_scratch_ref,\n    dv_scratch_ref,",
                 ),
                 ("      jax.ShapeDtypeStruct((bkv, head_dim_qk), jnp.float32),\n", ""),
                 ("      jax.ShapeDtypeStruct((bkv, head_dim_v), jnp.float32),\n", ""),
@@ -125,7 +126,7 @@ def _dkv_scratch(source: str, *, vmem: bool, output_buffers: int | None) -> str:
 
 
 def _dkv_output_accumulator(source: str) -> str:
-    """FP32输出窗口直接承载dK/dV累加，省去独立scratch及结束复制。"""
+    """Accumulate dK/dV directly in FP32 output windows, eliminating separate scratch and the final copy."""
     start = source.index("def _flash_attention_dkv_kernel(")
     middle = source.index("def _splash_attention_bwd_dkv(", start)
     end = source.index("def _splash_attention_bwd(", middle)
@@ -135,7 +136,7 @@ def _dkv_output_accumulator(source: str) -> str:
         raise RuntimeError("Splash dKV输出累加参数定位失败")
     kernel = kernel.replace(arguments, "")
     finish = kernel.index("  should_write = q_index == grid_width - 1")
-    # 独立反向没有dQ临时量；输出不再在结束时从scratch复制或被清零。
+    # The separate backward pass needs no dQ scratch; outputs are neither copied from scratch nor zeroed at exit.
     kernel = kernel[:finish] + "\n\n"
     kernel = kernel.replace("dk_scratch_ref", "dk_ref").replace("dv_scratch_ref", "dv_ref")
     kernel = kernel.replace("gradient scratch buffers", "gradient output accumulators")
@@ -171,7 +172,7 @@ def transformed_source(
     dq_kv_compute: int | None = None,
     dq_compute_unroll: bool = False,
 ) -> str:
-    """JAX 版本不兼容或改写位置不唯一时，拒绝生成候选模块。"""
+    """Reject incompatible JAX versions or ambiguous source matches before constructing an adapted module."""
     assert installed.__file__ is not None
     data = Path(installed.__file__).read_bytes()
     if jax.__version__ != "0.11.1":
@@ -228,8 +229,8 @@ def transformed_source(
             raise RuntimeError(f"Splash storage源码定位不唯一：{before!r}")
         source = source.replace(before, after)
     if bf16_dout:
-        # DI仍使用原始FP32 dO；只压缩随后送入反向矩阵计算的dO。
-        # 提前压缩DI输入的v1在完整模型中有两份梯度超差，原始失败保留。
+        # Compute DI from the original FP32 dO; compress only the dO subsequently used in backward matmuls.
+        # An earlier version compressed DI inputs too soon and failed two full-model gradient checks.
         marker = '  di = jnp.einsum("hsd,hsd->hs", o.astype(jnp.float32), do.astype(jnp.float32))'
         if source.count(marker) != 1 or source.count("    do = do_ref[...]") != 2:
             raise RuntimeError("Splash dO存储源码定位失败")
@@ -239,7 +240,8 @@ def transformed_source(
     if dkv_kv_buffers is not None:
         if dkv_kv_buffers not in (1, 2):
             raise ValueError("dKV K/V缓冲数量必须是1或2")
-        # K/V沿Q循环复用；只控制它们的搬运缓冲，Q/dO及输出策略保持原样。
+        # Reuse K/V across the query loop, changing only their transfer buffers and preserving Q/dO and output
+        # handling.
         marker = "  do_spec = o_spec\n\n  def logsumexp_index_map(\n      kv_index,"
         if source.count(marker) != 1:
             raise RuntimeError("Splash dKV缓冲源码定位失败")
@@ -267,7 +269,7 @@ def transformed_source(
                 [
                     (
                         "    # Outputs\n    dq_scratch_ref,\n    dq_ref,",
-                        "    # Outputs\n    dq_ref,\n    # VMEM临时量：跨KV循环保留。\n    dq_scratch_ref,",
+                        "    # Outputs\n    dq_ref,\n    # Keep VMEM scratch across the KV loop.\n    dq_scratch_ref,",
                     ),
                     ("      jax.ShapeDtypeStruct((bq, head_dim_qk), jnp.float32),\n", ""),
                     ("      pl.BlockSpec((bq, head_dim_qk), lambda *_: (0, 0)),\n", ""),
@@ -345,7 +347,7 @@ def module(
         name += "_unroll"
     filename = f"<{name}:{VARIANT}>"
     tree = ast.parse(source, filename=filename)
-    # 使用安装库的接口类型，防止布局enum的identity比较或pytree结构分叉。
+    # Use the installed library's types to preserve layout-enum identity and pytree structure.
     shared_types = {"SegmentIds", "QKVLayout", "BlockSizes"}
     tree.body = [node for node in tree.body if not (isinstance(node, ast.ClassDef) and node.name in shared_types)]
     variant = types.ModuleType(name)

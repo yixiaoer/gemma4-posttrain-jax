@@ -1,4 +1,4 @@
-"""检查四芯片 Pallas logprob 的尾部、重复目标及 softcap 边界。"""
+"""Test four-chip Pallas logprobs with tail blocks, repeated targets, and softcap boundaries."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from gemma4_posttrain_jax.sharding import DATA_AXIS, make_mesh
 
 
 def _assert_close(actual, expected, *, logps):
-    """保留 logprob 与 BF16 梯度各自的绝对、相对误差要求。"""
+    """Retain separate absolute and relative tolerances for logprobs and BF16 gradients."""
     a, b = np.asarray(actual).astype(np.float64), np.asarray(expected).astype(np.float64)
     assert a.shape == b.shape
     assert np.isfinite(a).all() and np.isfinite(b).all()
@@ -35,7 +35,7 @@ def test_product_tail_repeated_targets_and_softcap(softcap, scale, zero_gradient
         pytest.skip("requires four TPU v4 chips")
     mesh = make_mesh()
     rng = np.random.default_rng(20260925)
-    # token、词表和 hidden 都有尾部；每个分片边界的目标重复出现。
+    # Include token, vocabulary, and hidden tails, with repeated targets at every shard boundary.
     w = jax.device_put(
         jnp.asarray(rng.normal(size=(1036, 160)) * scale, jnp.bfloat16),
         NamedSharding(mesh, P(DATA_AXIS)),

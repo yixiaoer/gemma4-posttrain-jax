@@ -1,4 +1,6 @@
-"""共同运行时的实际设备内容检查、完整映射和版本确认；CPU控制不代替真实引擎。"""
+"""Check shared-runtime device contents, complete mappings, and version acknowledgements; CPU tests do not run the
+real engine.
+"""
 
 import hashlib
 import importlib.util
@@ -34,7 +36,7 @@ def test_shared_runtime_has_explicit_device_default():
 
 @pytest.mark.parametrize("bad_second_source", [False, True])
 def test_local_cpu_loaders_restore_functions_and_cache(tmp_path, monkeypatch, bad_second_source):
-    # 用实际可检查源码的两个模块，分别核正常退出和安装中途失败。
+    # Use two inspectable source modules to check normal cleanup and failure partway through installation.
     records, modules, originals = [], [], []
     for index, name in enumerate(("cpu_mesh", "model_weights_single_file_generator")):
         module_name = f"shared_loader_control_{index}"
@@ -142,7 +144,7 @@ def test_target_plan_checks_all_sources_and_targets(tiny_a):
 
 @pytest.mark.parametrize("reply_version", [2, 3])
 def test_client_commits_version_only_after_device_ack(monkeypatch, reply_version):
-    # 控制消息用真实socket；数据传输在前两个实际collective测试中检查。
+    # Send control messages through real sockets; the preceding collective tests cover device data transfer.
     client, server = socket.socketpair()
     client.settimeout(5)
     server.settimeout(5)

@@ -1,4 +1,4 @@
-"""在设备上转换、传输和比较推理权重；主机只接收检查结果。"""
+"""Convert, transfer, and compare inference weights on devices, returning only check results to the host."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any
 
 @lru_cache(maxsize=256)
 def device_converter(layout: str, shape: tuple[int, ...], shards: int) -> Any:
-    """缓存计算函数，不缓存参数数组；按位实现 FP32 到 BF16 的 ties-to-even 舍入。"""
+    """Cache functions, not parameter arrays; round FP32 to BF16 with integer ties-to-even operations."""
     import jax
     import jax.numpy as jnp
 
@@ -20,7 +20,7 @@ def device_converter(layout: str, shape: tuple[int, ...], shards: int) -> Any:
         for value in values:
             bits = jax.lax.bitcast_convert_type(value, jnp.uint32)
             finite = finite & jnp.all((bits & jnp.uint32(0x7F800000)) != jnp.uint32(0x7F800000))
-            # 整数舍入保留正负零和 BF16 subnormal，避免 TPU 浮点转换的 flush-to-zero。
+            # Integer rounding preserves signed zero and BF16 subnormals that TPU float conversions may flush to zero.
             rounded = ((bits + jnp.uint32(0x7FFF) + ((bits >> 16) & 1)) >> 16).astype(jnp.uint16)
             finite = finite & jnp.all((rounded & jnp.uint16(0x7F80)) != jnp.uint16(0x7F80))
             arrays.append(jax.lax.bitcast_convert_type(rounded, jnp.bfloat16))
@@ -56,14 +56,14 @@ def device_comparator(sharding: Any) -> Any:
         equal = jnp.all(
             jax.lax.bitcast_convert_type(expected, jnp.uint16) == jax.lax.bitcast_convert_type(actual, jnp.uint16)
         )
-        # 即使逻辑参数为 replicated，也必须比较每个物理副本；不能只读取一个 replica 的结果。
+        # Check every physical copy of replicated parameters, rather than reading one replica's result.
         return jax.lax.pmin(equal.astype(jnp.int32), sharding.mesh.axis_names).astype(jnp.bool_)
 
     return jax.jit(compare)
 
 
 def transfer_device_weight(item: Any, destination_sharding: Any) -> tuple[Any, dict[str, Any]]:
-    """只用于同一 JAX 运行时可访问的设备；包含完整往返位比较，不读取权重到 CPU。"""
+    """Transfer within one JAX runtime and compare all returned bits without reading weights onto the CPU."""
     import jax
 
     values = tuple(value for _, value in item.sources)
@@ -72,7 +72,7 @@ def transfer_device_weight(item: Any, destination_sharding: Any) -> tuple[Any, d
     source_devices = values[0].sharding.device_set
     if any(v.sharding.device_set != source_devices or not v.is_fully_addressable for v in values):
         raise ValueError("一个映射的源参数必须位于相同的可访问设备集合")
-    # 多 CPU 设备仅用于独立测试，正式入口由 TPU 引擎控制。
+    # Multiple CPU devices support isolated tests; the actual entry point uses the TPU engine.
     platforms = {d.platform for d in source_devices | destination_sharding.device_set}
     if platforms not in ({"tpu"}, {"cpu"}):
         raise ValueError("源和目标必须使用同一种支持的设备")
@@ -100,13 +100,13 @@ def transfer_device_weight(item: Any, destination_sharding: Any) -> tuple[Any, d
         checked = time.perf_counter()
         forward_s = chunk_report["forward_s"]
         check_s = chunk_report["check_s"]
-        # 分块中传输和检查交错执行；目标分配、重分片、标量控制和Python调度另列。
+        # Interleave block transfer and checks; account separately for allocation, resharding, and host control.
         transfer_overhead_s = max(0.0, checked - converted - forward_s - check_s)
     else:
         incoming = transfer_array_ici(expected, destination_sharding)
         jax.block_until_ready(incoming)
         transferred = time.perf_counter()
-        # 比较目标设备实际返回的内容，不能将 incoming 与它自身比较。
+        # Compare data read from the destination device, not the incoming array with itself.
         verification_sharding = destination_layout_on_source(expected, destination_sharding)
         returned = transfer_array_ici(incoming, verification_sharding)
         equal = device_comparator(verification_sharding)(_reshard(verification_sharding)(expected), returned)

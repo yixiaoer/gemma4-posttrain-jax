@@ -1,4 +1,4 @@
-"""共同 JAX 运行时的双进程引擎：控制消息走本机 socket，完整权重走 ICI。"""
+"""Run a two-process engine in a shared JAX runtime, using local sockets for control and ICI for weights."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def _merged_shards(model: Any, config: Any) -> list[int]:
 
 
 def target_plan(runner: Any, descriptor: dict[str, Any], config: Any) -> tuple[list[Any], dict[str, Any]]:
-    """根据完整训练参数规格及真实引擎核对覆盖，不分配模型大小的主机缓冲区。"""
+    """Check complete parameter coverage against the actual engine without allocating model-sized host buffers."""
     import jax
     import jax.numpy as jnp
 
@@ -89,7 +89,7 @@ def target_plan(runner: Any, descriptor: dict[str, Any], config: Any) -> tuple[l
 
 
 class SharedEngineRuntime(RemoteEngineRuntime):
-    """复用原串行控制协议和生成接口；进程由共同运行时启动器管理。"""
+    """Reuse serial control and generation interfaces; the shared-runtime launcher manages processes."""
 
     def __init__(self, config: EngineConfig, *, path: Path, timeout_s: float = 900):
         from .distributed_ici import SharedRuntimeWeightTransfer
@@ -201,7 +201,7 @@ class SharedEngineRuntime(RemoteEngineRuntime):
 
 
 def serve_shared_engine(path: Path, record_path: Path) -> None:
-    """rank1入口；任何请求失败均关闭此会话，不复用未完整提交的状态。"""
+    """Serve rank 1; close the session on any request failure and never reuse a partially committed state."""
     import jax
 
     from .distributed_ici import SharedRuntimeWeightTransfer

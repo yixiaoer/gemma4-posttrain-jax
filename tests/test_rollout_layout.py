@@ -1,4 +1,4 @@
-"""采样布局切换保持FP32 master、完整权重值及评估恢复身份。"""
+"""Preserve FP32 masters, all weight values, and evaluation/recovery identity across rollout layouts."""
 
 from __future__ import annotations
 
@@ -44,6 +44,8 @@ def test_rollout_layout_cast_preserves_master_and_global_weights(grad_tiny, layo
         (None, None, "replicated"),
         (None, {}, "replicated"),
         (None, {"rollout_layout": "fsdp"}, "fsdp"),
+        (None, {"rollout_layout": "tp"}, "tp"),
+        ("tp", {}, "tp"),
         ("fsdp", {}, "fsdp"),
         ("replicated", {"rollout_layout": "fsdp"}, "replicated"),
     ],

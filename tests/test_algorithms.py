@@ -1,4 +1,4 @@
-"""用论文公式、解析梯度与完整模型梯度验证算法组合，而非只检查配置字段。"""
+"""Validate objective combinations with published formulas, analytic gradients, and full-model gradients."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ def test_reinforce_length_weighting_matches_analytic_gradient(algorithm: str) ->
     policy = jnp.full((4, 4), -2.0)
     mask = jnp.asarray([[1, 1, 0, 0], [1, 1, 1, 1], [1, 0, 0, 0], [1, 1, 1, 0]], bool)
     actual = jax.grad(lambda p: grpo_loss(p, None, None, advantage, mask, **loss_options(config))[0])(policy)
-    # RLOO G2为另一条回答的奖励；Dr.GRPO为组均值，整体除固定N=8。
+    # For G=2, RLOO uses the other answer's reward as baseline; Dr. GRPO uses the group mean and fixed N=8 scaling.
     expected_advantage = jnp.asarray([-1.0, 1.0, -1.0, 1.0]) * (0.5 if algorithm == "drgrpo" else 1.0)
     denominator = 4 * (8 if algorithm == "drgrpo" else 1)
     np.testing.assert_allclose(actual, -expected_advantage[:, None] * mask / denominator, atol=1e-7, rtol=1e-6)
@@ -171,7 +171,7 @@ def test_filtered_loss_and_tis_update_matches_dense_context_oracle(grad_tiny, mi
         )
 
     actual, metrics = jax.jit(lambda state: run_step(state, optimizer))(initial)
-    # 通过测试用Optax状态保留实际trainer梯度，先检查数学，再检查Adam更新。
+    # Capture actual trainer gradients in a test Optax state, checking the math before the Adam update.
     collector = optax.GradientTransformation(
         lambda _: (),
         lambda gradient, _state, _params: (jax.tree.map(jnp.zeros_like, gradient), gradient),

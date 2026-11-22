@@ -1,4 +1,4 @@
-"""评估集合身份、MATH gold/source_id 与 checkpoint 留出声明的 CPU 回归。"""
+"""Check evaluation-set identity, MATH answers/source IDs, and checkpoint holdout metadata on CPU."""
 
 from __future__ import annotations
 

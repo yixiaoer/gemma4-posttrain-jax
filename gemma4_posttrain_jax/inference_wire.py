@@ -1,6 +1,7 @@
-"""本机独立进程的有限JSON控制帧、完整 FP32 参数结构描述与原始字节运输。
+"""Transport bounded JSON control frames, FP32 parameter metadata, and raw bytes between local processes.
 
-协议不反序列化pickle；只接收白名单参数结构，缓冲寿命以接收/提交ACK区分。
+The protocol does not unpickle data and accepts only approved parameter structures. Receipt and commit
+acknowledgements define distinct buffer lifetimes.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ CHUNK_BYTES = 8 * 1024**2
 
 
 class WireError(RuntimeError):
-    """包含边界或传输失败，调用方不得继续复用半个请求。"""
+    """Report framing or transport failures; the caller must not reuse a partial request."""
 
 
 def canonical(value: Any) -> bytes:
@@ -175,7 +176,7 @@ def validate_descriptor(descriptor: dict[str, Any], config: Any = None) -> tuple
             ):
                 raise WireError("数组的顺序、名称或类型不符")
             size = math.prod(shape) * 4
-            # 不从发送端的任意nbytes决定分配，按已经校验的shape计算。
+            # Calculate allocation size from validated shapes, not an arbitrary byte count from the sender.
             total += size
             if size > MAX_LEAF_BYTES or total > MAX_TREE_BYTES or len(records) >= MAX_LEAVES:
                 raise WireError("参数总字节数或数组数量超出限制")

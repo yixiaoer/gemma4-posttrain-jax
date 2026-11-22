@@ -1,4 +1,4 @@
-"""归档前的CPU检查必须拒绝损坏状态和错位的Adam计数。"""
+"""Reject corrupt checkpoint state and inconsistent Adam counts during CPU inspection."""
 
 import json
 import sys

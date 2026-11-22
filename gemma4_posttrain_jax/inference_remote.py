@@ -1,4 +1,4 @@
-"""训练侧同步RPC：完整FP32字节运输、版本提交、生成与本次进程专属清理。"""
+"""Synchronous training-side RPC for FP32 transfer, version commits, generation, and owned-process cleanup."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def validate_worker_module(value: str) -> str:
 
 @contextlib.contextmanager
 def parameter_host_view(leaf: Any, jax: Any, np: Any, mode: str) -> Iterator[Any]:
-    """按指定模式取得单个参数的连续FP32主机视图，并及时释放短期设备副本。"""
+    """Obtain a contiguous FP32 host view for one parameter and promptly release any temporary device copy."""
     temporary = None
     try:
         source = leaf
@@ -66,14 +66,14 @@ def parameter_host_view(leaf: Any, jax: Any, np: Any, mode: str) -> Iterator[Any
 
 
 def isolated_library_environment(parent: Mapping[str, str]) -> dict[str, str]:
-    """让子解释器的libtpu包选择自己的库；导入父包可能已修改父环境。"""
+    """Let the child interpreter's libtpu package select its library; the parent's imports may alter its environment."""
     environment = dict(parent)
     environment.pop("TPU_LIBRARY_PATH", None)
     return environment
 
 
 def inspect_engine_environment(python_executable: Path) -> dict[str, Any]:
-    """在指定解释器取得实际环境身份，供训练checkpoint稳定配置与实机握手比较。"""
+    """Read environment identity with the target interpreter for checkpoint compatibility and engine handshakes."""
     environment = isolated_library_environment(os.environ) | {
         "JAX_PLATFORMS": "cpu",
         "JAX_DEFAULT_MATMUL_PRECISION": "highest",
@@ -103,7 +103,7 @@ def inspect_engine_environment(python_executable: Path) -> dict[str, Any]:
 
 
 def live_owned_group_members(group_id: int) -> list[int]:
-    """查询本次独立session的活进程；已退出但尚未被收养者回收的僵尸不再执行。"""
+    """Find live processes in this session; exited zombies no longer execute even before their parent reaps them."""
     if type(group_id) is not int or group_id <= 1 or group_id == os.getpgrp():
         raise ValueError("不能把训练进程组作为引擎清理对象")
     members = []
@@ -123,7 +123,7 @@ def live_owned_group_members(group_id: int) -> list[int]:
 
 
 def stop_owned_group(group_id: int, *, timeout_s: float = 5) -> dict[str, Any]:
-    """worker本身退出后仍检查同组子进程；仅处理启动时建立的独立进程组。"""
+    """Check for surviving children after the worker exits, limited to the process group created at launch."""
     remaining = live_owned_group_members(group_id)
     report: dict[str, Any] = {"initial_live_members": remaining, "signals": [], "complete": False}
     for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -141,7 +141,9 @@ def stop_owned_group(group_id: int, *, timeout_s: float = 5) -> dict[str, Any]:
 
 
 class RemoteEngineRuntime:
-    """单个训练调用线程、单个本机推理子进程；不支持任意远程地址或并发请求。"""
+    """Use one calling thread and one local inference worker; remote addresses and concurrent requests are
+    unsupported.
+    """
 
     def __init__(
         self,
@@ -369,11 +371,12 @@ class RemoteEngineRuntime:
                 "allocator_trim": {"enabled": False},
             }
             if trim_training_allocator:
-                # Python会让循环变量继续引用最后一个主机数组；先释放它再请求glibc回收空闲页。
+                # The loop variable retains the last host array; release it before asking glibc to reclaim unused
+                # pages.
                 del host
                 host_cleanup["gc_collected"] = gc.collect()
                 host_cleanup["allocator_trim"] = trim_host_allocator()
-            # 所有host ACK仍不足以更新策略版本；必须收到实际设备提交响应。
+            # Host acknowledgements do not commit a policy version; wait for the device commit response.
             response = self._response(request_id, "device_committed")
             report: dict[str, Any] = response["report"]
             if (
@@ -466,7 +469,8 @@ class RemoteEngineRuntime:
                 try:
                     group = stop_owned_group(process.pid)
                     report["owned_group_cleanup"] = group
-                    # 等待超时后进程可能自行退出；实际发信号与错过期限分别记录。
+                    # The process may exit after the wait times out; record missed deadlines separately from signals
+                    # sent.
                     report["forced_group_termination"] = bool(group["signals"])
                     process.wait(timeout=5)
                 except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:

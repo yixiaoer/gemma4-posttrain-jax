@@ -1,4 +1,4 @@
-"""设备权重转换、跨设备内容和失败条件；运行前设置四个 CPU 设备或使用 TPU。"""
+"""Check weight conversion, device-to-device contents, and failures using four CPU devices or actual TPUs."""
 
 import jax
 import jax.numpy as jnp
@@ -14,7 +14,7 @@ from gemma4_posttrain_jax.inference_weights import _host_bf16, _Mapping
 
 
 def test_rounding_boundaries_and_all_bf16_encodings():
-    # 包括 BF16 全部有限编码及各个舍入边界两侧；FP32 非有限值另行拒绝。
+    # Cover all finite BF16 encodings and both sides of rounding boundaries; reject nonfinite FP32 separately.
     high = np.arange(65536, dtype=np.uint32)
     high = high[(high & 0x7F80) != 0x7F80]
     bits = ((high[:, None] << 16) | np.array([0, 0x7FFF, 0x8000, 0x8001, 0xFFFF], np.uint32)).ravel()
@@ -78,7 +78,7 @@ def test_reject_host_array_as_device_transport():
 @pytest.mark.parametrize("target_axis", [None, 0, 1])
 def test_collective_preserves_bits_without_host_transfer(source_axis, target_axis, dtype):
     source_mesh = Mesh(np.array(jax.devices()[:2]), ("src",))
-    # 倒序 mesh 检查逻辑分片顺序，不能假设全局 device id 与 mesh index 相同。
+    # Reverse the mesh to test logical shard order; global device IDs need not equal mesh indices.
     target_mesh = Mesh(np.array(jax.devices()[2:4][::-1]), ("dst",))
     src_spec = [None, None]
     dst_spec = [None, None]
@@ -88,11 +88,11 @@ def test_collective_preserves_bits_without_host_transfer(source_axis, target_axi
         dst_spec[target_axis] = "dst"
     bits = np.arange(65536, dtype=np.uint16).reshape(256, 256)
     if dtype == bfloat16:
-        # BF16 权重只允许有限值；CPU collective 会规范化 NaN 的编码。
+        # BF16 weights must be finite; CPU collectives may canonicalize NaN encodings.
         bits[(bits & 0x7F80) == 0x7F80] = 0
     value = jax.device_put(bits.view(dtype), NamedSharding(source_mesh, P(*src_spec)))
     destination = NamedSharding(target_mesh, P(*dst_spec))
-    # uint16 覆盖全部编码；BF16 覆盖全部有限编码，包括正负零和 subnormal。
+    # Cover all uint16 patterns and all finite BF16 patterns, including signed zero and subnormals.
     with (
         jax.transfer_guard_host_to_device("disallow_explicit"),
         jax.transfer_guard_device_to_host("disallow_explicit"),
@@ -112,7 +112,7 @@ def test_comparison_detects_corruption_in_second_replica():
     expected = jax.device_put(host, sharding)
     corrupted = host.copy()
     corrupted.view(np.uint16)[-1, -1] ^= np.uint16(1)
-    # 故意构造不一致副本，检查比较函数不会只相信 replicated 声明而忽略第二颗芯片。
+    # Create inconsistent replicas to ensure the check reads every chip instead of trusting replicated metadata.
     actual = jax.make_array_from_single_device_arrays(
         host.shape, sharding, [jax.device_put(host, devices[0]), jax.device_put(corrupted, devices[1])]
     )

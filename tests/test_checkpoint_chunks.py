@@ -1,4 +1,4 @@
-"""检查分块保存的完整字节、任意分片方向和读取内存上限。"""
+"""Check checkpoint bytes, arbitrary shard axes, and bounded readback memory."""
 
 from __future__ import annotations
 

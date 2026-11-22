@@ -145,7 +145,7 @@ def test_math_rewards_keep_success_format_and_length_separate() -> None:
 
 
 def test_reward_workers_after_jax_initialization_match_serial() -> None:
-    # 模拟真实 host loop 的顺序：先运行 JAX，再启动数学奖励 worker。
+    # Follow the actual host-loop order: initialize JAX before starting math-reward workers.
     jax.block_until_ready(jnp.arange(4) + 1)
     completions = ["The answer is \\boxed{14}.", "The answer is \\boxed{12}."]
     serial = score_completions(completions, ["14", "14"], workers=1)
@@ -155,7 +155,7 @@ def test_reward_workers_after_jax_initialization_match_serial() -> None:
 
 
 def test_grpo_data_and_rng_resume_across_epoch_boundary() -> None:
-    # 每个 epoch 两批，丢弃尾部一个样本；从全局步数可重建同一批和随机 key。
+    # Use two batches per epoch and drop one tail sample; recover the same batch and RNG key from the global index.
     continuous = [grpo_prompt_indices(9, 4, step, seed=7) for step in range(5)]
     resumed = [grpo_prompt_indices(9, 4, step, seed=7) for step in range(2, 5)]
     assert continuous[2:] == resumed
@@ -261,7 +261,7 @@ def test_tiny_grpo_update_has_unit_ratio_respects_mask_and_freeze(grad_tiny) -> 
 
 @pytest.mark.parametrize("aggregation", ["sequence-mean-token-mean", "token-mean", "sequence-mean-token-scale"])
 def test_grpo_microbatch_matches_full_gradient_and_adam(grad_tiny, aggregation) -> None:
-    # 不同微批的有效 token/行数不同，并含整行 padding，防止误用微批均值的平均。
+    # Vary valid token and row counts, including empty rows, to catch incorrect averaging of microbatch means.
     import optax
 
     _, params, config = grad_tiny

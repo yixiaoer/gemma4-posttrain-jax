@@ -1,4 +1,4 @@
-"""LoRA复用GRPO的四CPU微批/轮内old/完整Adam恢复，并保持基础权重冻结。"""
+"""Test LoRA microbatching, fixed old policies, and full Adam recovery on four CPU devices with a frozen base."""
 
 from __future__ import annotations
 
@@ -32,7 +32,8 @@ def training_fixture():
     ids = jnp.asarray([[0, 2, 11], [2, 8, 7]] * 4, jnp.int32)
     completion = jnp.asarray([[3, 9, 0, 0], [5, 4, 1, 0], [1, 0, 0, 0], [8, 3, 6, 1]] * 2, jnp.int32)
     mask = completion != 0
-    # 重复token行的第二组不能恰好取相反优势，否则真实梯度为零，Adam会放大归约舍入噪声。
+    # Avoid opposite advantages on repeated token rows: zero true gradients would amplify reduction noise through
+    # Adam.
     advantages = compute_advantages(jnp.asarray([0, 1, 1, 1, 1, 0, 1, 0]), 4)
     return base, config, settings, params, (ids, ids != 0, completion, mask, advantages)
 
@@ -93,7 +94,8 @@ def test_four_cpu_microbatch_joint_old_and_full_state_restore(training_fixture, 
     assert read_checkpoint_metadata(checkpoint)["metadata"] == metadata
     template = jax.eval_shape(lambda: state)
     restored = load_train_state(checkpoint, template, shardings=tree_shardings(state))
-    # 在完整一轮结束后重新计算 old；恢复后的两次更新与连续训练的所有数组一致。
+    # Recompute old probabilities after a complete rollout; both resumed updates must match every continuous-run
+    # array.
     for branch in range(2):
         target = state if branch == 0 else restored
         target, next_metrics = micro(target, base, old, jnp.asarray(True))

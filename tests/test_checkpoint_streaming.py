@@ -1,4 +1,4 @@
-"""逐张量保存与标准safetensors、旧格式及原子失败的兼容性。"""
+"""Check streamed checkpoint compatibility with safetensors, legacy files, and atomic failure handling."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def test_streamed_state_is_readable_by_standard_library_and_legacy_loader(tmp_pa
         assert loaded[name].dtype == reference[name].dtype
         assert loaded[name].shape == reference[name].shape
 
-    # 旧库生成的文件继续由同一个恢复入口读取；新writer不引入格式版本变更。
+    # Load files from the old writer through the same recovery entry point, without changing the format version.
     save_file(reference, target / "state.safetensors")
     template = jax.tree.map(lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype), state)
     restored = checkpoint.load_train_state(target, template)
@@ -151,7 +151,7 @@ def test_restore_releases_current_array_when_transfer_wait_fails(tmp_path, monke
         created.append(result)
         return result
 
-    # 首个传输成功，第二个设备数组已创建，但在等待结束时失败。
+    # The first transfer succeeds; the second device array exists but fails while waiting for completion.
     monkeypatch.setattr(checkpoint.jnp, "asarray", put)
     with pytest.raises(RuntimeError, match="transfer fence failed"):
         checkpoint.load_train_state(path, state)

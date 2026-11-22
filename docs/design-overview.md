@@ -33,7 +33,7 @@ SFT 和 GRPO 最主要的区别在于训练回答的来源。SFT 直接使用数
 |---|---|---|
 | 模型与权重 | 加载 HF 配置、转换预训练权重、实现文本模型前向 | [weights.py](../gemma4_posttrain_jax/weights.py)、[model.py](../gemma4_posttrain_jax/model.py) |
 | 训练计算 | 构造算法目标、计算梯度、累积 microbatch、更新参数 | [algorithms.py](../gemma4_posttrain_jax/algorithms.py)、[losses.py](../gemma4_posttrain_jax/losses.py) |
-| 原生生成 | prefill、带缓存的逐 token 解码、采样，并记录生成结果 | [sampler.py](../gemma4_posttrain_jax/sampler.py) |
+| 原生生成 | prefill、带缓存的逐 token 解码、采样，以及 TP 布局下的生成 | [sampler.py](../gemma4_posttrain_jax/sampler.py)、[tp_rollout.py](../gemma4_posttrain_jax/tp_rollout.py) |
 | 数据与评估 | 数据顺序、题目编号、输入处理、评分和评估记录 | [data.py](../gemma4_posttrain_jax/data.py)、[evaluation.py](../gemma4_posttrain_jax/evaluation.py) |
 | 设备布局 | 定义参数、训练状态和输入 batch 在 TPU 设备间的分片方式 | [sharding.py](../gemma4_posttrain_jax/sharding.py) |
 | 保存与恢复 | 保存训练数组、校验 checkpoint、按目标分片加载状态 | [checkpoint.py](../gemma4_posttrain_jax/checkpoint.py) |
@@ -43,7 +43,8 @@ SFT 和 GRPO 最主要的区别在于训练回答的来源。SFT 直接使用数
 
 模型实现保留 Gemma 4 的逐层注意力类型、共享键值、滑动窗口、逐层输入嵌入（Per-Layer Embeddings，PLE）、旋转位置编码（Rotary Position Embedding，RoPE）及逐层缩放。输入 embedding 与输出头共享权重。HF 映射同时处理参数名称、维度布局和计算语义，[前向测试](../tests/test_model_ops.py)和[梯度对照](../tests/test_grad_parity.py)检查它与 Transformers 的对应计算。
 
-训练过程由 TrainState 管理，包含三个字段：
+训练状态由 `TrainState` 管理，包含三个字段：
+
 - `params_f32`：FP32 主参数
 - `opt_state`：优化器状态
 - `step`：已经执行的参数更新次数
@@ -52,7 +53,7 @@ SFT 和 GRPO 最主要的区别在于训练回答的来源。SFT 直接使用数
 
 如果冻结 embedding，它仍然参与模型前向，但不需要为它维护 Adam 的一阶矩和二阶矩。
 
-TrainState 不负责保存所有训练信息。模型配置、tokenizer、数据读取进度和日志由训练入口管理；其中恢复训练所必需的信息，例如数据处理到的位置，会写入 checkpoint 元数据。
+模型配置、tokenizer、数据读取进度和日志由训练入口管理。其中恢复训练所必需的信息，例如数据处理到的位置，会写入 checkpoint 元数据。
 
 基础模型文件和数据文件仍需要由使用者提供。
 
@@ -107,7 +108,7 @@ Behavior 和 Old 即使使用相同的模型参数，数值也可能略有不同
 
 ### 4.2 数据和参数在TPU上的分布
 
-项目使用一维设备 mesh，轴名为 d。主要实验环境是 TPU v4-8，对应 4 个 JAX 设备。
+训练使用一维设备 mesh，轴名为 `d`。主要实验环境是 TPU v4-8，对应 4 个 JAX 设备；生成阶段的布局可以单独选择。
 
 训练参数采用全分片数据并行（Fully Sharded Data Parallel，FSDP）的布局。较大的参数张量分布在多个设备上，每个设备只保存其中一部分。对应的梯度和 Adam 状态也按照相同规则分片；较小的向量和标量通常会复制到各个设备。计算过程中需要哪些跨设备通信，由 JAX/XLA 根据计算和分片布局安排。
 
@@ -123,7 +124,7 @@ Gemma 4 词表较大，训练时如果先算出完整的 `[batch, sequence, voca
 
 项目还提供 `--logprob-backend pallas` 作为实验选项，在词表并行的前提下，保留了原生模型前向、对 hidden 的梯度计算，以及目标 token 对应的权重梯度，只使用 Pallas 计算归一化项对输出权重的梯度。
 
-目前该实现仅支持已经适配的四设备 TPU v4、BF16 配置。默认后端仍然是 jax，Pallas logprob 也不会替换生成阶段的输出头计算，后续会继续开发，支持更多 Pallas 后端的加速计算。
+Pallas logprob 目前仅支持四设备 TPU v4、BF16 配置，作用于训练计算。默认后端为 `jax`，生成阶段的输出头计算不受这一选项影响。
 
 ### 4.4 内存管理
 
@@ -163,7 +164,6 @@ Gemma 4 词表较大，训练时如果先算出完整的 `[batch, sequence, voca
 
 加载时，程序先检查数组名称、形状和 dtype，确认与目标训练状态兼容，再按照调用方提供的分片规则把数组放回设备。这种分块读写不会改变 checkpoint 的文件格式，但目前也不等同于支持多个主机联合保存。
 
-
 ### 5.1 恢复训练需要哪些状态
 
 断点续训的准确完成不仅需要模型参数和优化器状态，还需要恢复数据读取位置以及后续随机数的生成方式。
@@ -182,7 +182,7 @@ GRPO 只会在一轮的 μ 次更新全部完成后保存 checkpoint。这个时
 
 跨主机 checkpoint、改变设备布局后保持完全一致的训练轨迹、从解码中途继续，以及恢复异步生成队列等能力，都需要进一步实现和验证。
 
-### 5.3 检查断点续训的恢复
+### 5.3 检查恢复结果
 
 训练能够从 checkpoint 继续运行，并不代表恢复后的状态与连续训练一致。
 
@@ -210,11 +210,16 @@ ICI（Inter-Chip Interconnect）是 TPU 芯片间的高速互联。原生生成�
 |---|---|---|
 | 原生 rollout，`--rollout-layout replicated` | 训练和生成轮流使用同一组四设备；生成时每个设备保存完整 BF16 权重 | 生成开始前，将训练中分片存储的权重汇集并复制到各设备 |
 | 原生 rollout，`--rollout-layout fsdp` | 训练和生成仍使用同一组四设备；生成阶段保留分片权重 | 生成计算过程中，由 JAX/XLA 根据分片安排跨设备通信 |
+| 原生 rollout，`--rollout-layout tp` | 训练保持原分片，生成阶段改用 TP；支持全参数同步训练与独立评估 | 生成前转换 BF16 权重布局，解码时计算矩阵分片并归约结果；批量满足要求时可融合归约、norm 与部分 MLP |
 | tpu-inference，同进程 ICI 配置 | 训练和引擎使用同一个进程与 JAX 运行时；默认两设备训练、两设备推理 | 将训练侧更新后的权重传到推理设备，并转换为引擎需要的 dtype 和布局 |
 
-原生 rollout 的权重转换由 [reshard_for_rollout](../gemma4_posttrain_jax/sharding.py) 完成。
+`replicated` 和 `fsdp` 生成布局的权重转换由 [reshard_for_rollout](../gemma4_posttrain_jax/sharding.py) 完成；TP 生成的布局转换位于 [tp_rollout.py](../gemma4_posttrain_jax/tp_rollout.py)。
 
 即使训练和生成使用同一组设备，两者仍然可能采用不同的权重布局。默认 replicated 方式会在生成前一次性准备完整的 BF16 权重副本，因此后续逐 token 解码不需要反复跨设备同步整套模型参数。相比之下，FSDP 生成布局会继续使用分片权重，跨设备通信可能发生在生成计算内部。
+
+TP 生成为解码显式安排参数与激活的分片。使用四芯片且每批行数是 `8 × 4` 的倍数时，`--tp-allreduce auto` 选择按行拆分 attention、保留本地残差的融合实现；其它适用批量选择按头拆分的融合实现。实际模式写入训练配置，checkpoint 恢复和独立评估默认继承它。归约与矩阵计算顺序会影响浮点结果，因此显式更改模式属于新的数值配置，不保证逐位一致。
+
+TP 入口目前用于全参数同步原生训练，不与 LoRA 或其它生成后端组合。通用采样器的 top-k/top-p 选项也不适用于这一入口。
 
 ### 6.2 tpu-inference 适配层
 
@@ -238,16 +243,16 @@ ICI（Inter-Chip Interconnect）是 TPU 芯片间的高速互联。原生生成�
 
 ### 6.4 其它进程和权重传输方式
 
-除了推荐的同进程方式，项目还保留了两种双进程实现，主要用于开发、复现和对照不同的运行时及传输行为，目前不推荐使用：
+项目还保留了两种双进程实现，用于研究进程隔离、运行时和权重传输行为。日常实验推荐使用前面的同进程配置。
 
 | 对照配置 | 实现方式 |
 |---|---|
 | `--rollout-backend inference-process` | 训练和推理运行在独立的 Python 进程中，分别使用自己的 JAX 运行时，可以采用不同依赖环境；目前各使用两设备，通过主机中转权重 |
 | `--rollout-backend inference-distributed` | 训练和推理使用两个 Python 进程，共享分布式运行时，要求相同的 JAX/libtpu 环境；目前各使用两设备，通过 ICI 同步权重 |
 
-在这两种配置下，`--inference-weight-transport auto` 分别选择主机中转（主机中转会慢很多，所以建议完全不使用）和 ICI传输。
+在这两种配置下，`--inference-weight-transport auto` 分别选择主机中转和 ICI 传输。主机中转需要先把权重从设备读回主机，再送入推理设备；这部分复制和等待也需要计入迭代耗时。
 
-需要注意，分布式运行时不会仅因为切换了传输参数就自动建立。使用 inference-distributed 时，调用方需要先初始化共同的分布式环境，再启动训练端和推理接收端。
+使用 `inference-distributed` 时，调用方需要先初始化共同的分布式环境，再启动训练端和推理接收端；仅切换传输参数不会建立这个环境。
 
 双进程实现也不代表训练与生成已经实现异步重叠执行。当前这些配置主要用于比较进程隔离方式、运行时行为和权重传输机制，而不是提供完整的异步训练流水线。
 
@@ -255,4 +260,6 @@ ICI（Inter-Chip Interconnect）是 TPU 芯片间的高速互联。原生生成�
 
 tpu-inference 依赖固定版本的推理引擎环境和 libtpu，因此实际使用时需要针对具体配置验证完整流程，包括模型生成、权重同步、参数更新、checkpoint 保存和恢复。
 
-目前已有的同步数组测试只验证权重传输本身，项目也尚未在相同模型、数据和训练配置下，对原生生成、同进程 tpu-inference 和两种双进程方式进行完整的端到端性能对比。因此，当前推荐同进程 ICI 配置，主要是基于其运行时与权重同步设计。
+同步数组测试验证权重传输内容；另有两组 E2B 同步实验比较本项目和 Tunix 分别使用原生生成或同进程 tpu-inference 时的完整迭代成本。这组实验的引擎适配器让训练与推理轮流使用同一组四芯片，记录权重版本并在训练前释放闲置推理权重与 KV。每个进程运行 12 次更新，用于测量迭代耗时；完整保存、新进程恢复和长期质量需要单独验证。
+
+上述测速使用了专门的实验适配器。普通 `train_grpo.py` 的引擎配置默认是两芯片训练、两芯片推理，设备安排不同，不能直接套用这些测速数字。

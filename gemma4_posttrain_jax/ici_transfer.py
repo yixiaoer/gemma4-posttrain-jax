@@ -1,4 +1,4 @@
-"""用共同 mesh 上的 collective-permute 传递权重，避免跨 mesh 的主机暂存。"""
+"""Transfer weights with collective-permute on a shared mesh, avoiding host staging between meshes."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ def _zeros(shape: tuple[int, ...], dtype: Any, sharding: Any) -> Any:
     import jax
     import jax.numpy as jnp
 
-    # 只缓存函数；不得缓存随模型大小增长的缓冲区。
+    # Cache functions only, never buffers that grow with model size.
     return jax.jit(lambda: jnp.zeros(shape, dtype), out_shardings=sharding)
 
 
@@ -45,7 +45,7 @@ def collective_function(mesh: Any) -> Any:
 
 
 def destination_layout_on_source(value: Any, destination: Any) -> Any:
-    """在源芯片上表达目标的分片方式，包含目标的每个物理副本。"""
+    """Express destination sharding on the source chips, including every physical destination replica."""
     import numpy as np
     from jax.sharding import Mesh, NamedSharding
 
@@ -57,9 +57,10 @@ def destination_layout_on_source(value: Any, destination: Any) -> Any:
 
 
 def transfer_array_ici(value: Any, destination: Any) -> Any:
-    """两侧芯片数相同、互不重叠；当前验证范围是同进程。
+    """Transfer between disjoint, equally sized chip groups in the same process.
 
-    对每个目标分片，先在训练 mesh 内形成对应分片，再由 collective 发往目标芯片。
+    First construct each destination shard within the training mesh, then send it to its destination chip with a
+    collective.
     """
     import jax
     import numpy as np
@@ -127,7 +128,7 @@ def _write_tile(sharding: Any, count: int, local_rows: int) -> Any:
             )
         return value
 
-    # 只 donate 本函数分配的目标新数组，训练参数和引擎原权重均不参与 donation。
+    # Donate only newly allocated destination arrays, preserving training parameters and existing engine weights.
     return jax.jit(write, donate_argnums=(0,))
 
 
@@ -140,7 +141,7 @@ def _target_tile(sharding: Any, count: int, local_rows: int, length: int) -> Any
     @jax.shard_map(mesh=sharding.mesh, in_specs=(P(), P()), out_specs=P(), check_vma=False)
     def read(value: Any, offset: Any) -> Any:
         blocks = [jax.lax.dynamic_slice_in_dim(value, offset + i * local_rows, length, axis=0) for i in range(count)]
-        # TPU 的 BF16 concatenate 可降为浮点 maximum，冲掉 subnormal；按整数位拼接。
+        # TPU BF16 concatenate may lower to floating-point maximum and flush subnormals; concatenate integer bits.
         bits = jnp.concatenate(
             jax.lax.optimization_barrier(tuple(jax.lax.bitcast_convert_type(block, jnp.uint16) for block in blocks)),
             axis=0,
@@ -151,9 +152,10 @@ def _target_tile(sharding: Any, count: int, local_rows: int, length: int) -> Any
 
 
 def transfer_large_replicated_weight(value: Any, destination: Any, *, chunk_bytes: int = 16 << 20) -> Any:
-    """按源分片读取有限大小的块，在目标写入后独立读回检查每个副本。
+    """Read bounded source-shard blocks and independently verify every written destination replica.
 
-    当前覆盖一维源 mesh 和目标全复制的大参数；源分片先统一到首维。
+    Currently supports a one-dimensional source mesh and fully replicated destination parameters, after
+    resharding the source along its first axis.
     """
     import time
 
@@ -180,7 +182,7 @@ def transfer_large_replicated_weight(value: Any, destination: Any, *, chunk_byte
     local_rows = value.shape[0] // count
     if local_rows >= 2**31:
         raise ValueError("当前分块索引要求单个源分片少于 2**31 行")
-    # 保留原始行形状；展平真实 PLE 会触发每块整参数的布局转换，抵消 ICI 收益。
+    # Keep the original row shape; flattening PLE triggers a full-parameter layout conversion for every block.
     row_bytes = int(np.prod(value.shape[1:])) * value.dtype.itemsize
     rows = min(max(1, chunk_bytes // row_bytes), local_rows)
     source_rep = NamedSharding(source.mesh, P())
@@ -200,7 +202,7 @@ def transfer_large_replicated_weight(value: Any, destination: Any, *, chunk_byte
         incoming = _write_tile(destination, count, local_rows)(incoming, sent, target_offset)
         incoming.block_until_ready()
         written = time.perf_counter()
-        # 与写入分开编译，避免编译器把 read-after-write 检查简化成比较输入本身。
+        # Compile reads separately so the compiler cannot replace the readback check with input self-comparison.
         actual = _target_tile(destination, count, local_rows, length)(incoming, target_offset)
         returned = transfer_array_ici(actual, source_rep)
         passed = passed & device_comparator(source_rep)(expected, returned)

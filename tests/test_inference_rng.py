@@ -1,4 +1,4 @@
-"""真实CPU typed key运输、请求契约与生成失败生命周期回归。"""
+"""Test actual typed-key transfers on CPU, request contracts, and generation-failure cleanup."""
 
 import sys
 from pathlib import Path
